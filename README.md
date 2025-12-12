@@ -1,10 +1,6 @@
-# rendez / workdist
+# rendez
 
-Distributed slot ownership for Go services without a central manager. Each node competes for leases in Redis, using rendezvous hashing to decide who _should_ own each logical slot and gentle handoff to avoid churn.
-
-## Status
-
-Early library skeleton with Redis backend, core coordinator, HRW hashing, and unit tests. Interfaces are stable enough for experiments; expect iteration.
+Distributed slot ownership for Go services without a central manager. Each node runs the same control loops, competes for leases in Redis, and uses weighted rendezvous hashing (HRW) to decide who _should_ own every `(topic, slot)` pair. No hard steals: healthy leases are left alone and ownership changes only through expiry or voluntary handoff.
 
 ## Quickstart
 
@@ -14,86 +10,114 @@ package main
 import (
 	"context"
 	"log"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/you/workdist"
-	"github.com/you/workdist/coord/redis"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/suyash-sneo/rendez/pkg/rendez"
 )
 
-type printRunner struct{}
+type printerFactory struct{}
 
-func (r *printRunner) Run(ctx context.Context) error {
+func (printerFactory) NewConsumer(slot rendez.Slot) (rendez.Consumer, error) {
+	return &printer{slot: slot}, nil
+}
+
+type printer struct{ slot rendez.Slot }
+
+func (p *printer) Run(ctx context.Context) error {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
-			log.Println("processing slot work")
+		case <-t.C:
+			log.Printf("[slot %s] doing work", p.slot.Key())
 		}
 	}
 }
-func (r *printRunner) Stop(ctx context.Context) error { return nil }
-
-type printFactory struct{}
-
-func (f *printFactory) NewSlotRunner(slot workdist.Slot) (workdist.SlotRunner, error) {
-	log.Printf("starting runner for %s", slot.Key())
-	return &printRunner{}, nil
-}
+func (p *printer) Stop(context.Context) error { return nil }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := redis.New(redis.Options{Addr: "127.0.0.1:6379"})
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	cfg := rendez.DefaultConfig()
+	cfg.ClusterID = "demo"
+	cfg.NodeID = "worker-1"          // optional; defaults to hostname
+	cfg.StaticTopics = []rendez.TopicConfig{{Name: "topicA", Partitions: 4}}
+
+	ctrl, err := rendez.NewController(cfg, client, printerFactory{}, rendez.NopLogger(), rendez.NopMetrics())
 	if err != nil {
-		log.Fatalf("redis: %v", err)
+		log.Fatalf("controller: %v", err)
 	}
-	provider := workdist.NewStaticParallelismProvider(map[string]int{
-		"kafka.topic.A": 3,
-	})
-	cfg := workdist.DefaultConfig()
-	coord, err := workdist.NewCoordinator(cfg, store, provider, &printFactory{}, workdist.NewDefaultNodeIDProvider(), workdist.NopLogger(), workdist.NopMetrics())
-	if err != nil {
-		log.Fatalf("coordinator: %v", err)
-	}
-	if err := coord.Run(ctx); err != nil {
-		log.Fatalf("run: %v", err)
+	if err := ctrl.Start(ctx); err != nil && ctx.Err() == nil {
+		log.Fatalf("controller exited: %v", err)
 	}
 }
 ```
 
-Run multiple copies of this process against the same Redis. Slots distribute automatically and rebalance when nodes join or leave.
+Run multiple processes with the same Redis endpoint; slots will converge to the HRW owner set, recover quickly on pod death, and never steal healthy leases.
 
-## Concepts
+## Behavior and guarantees
 
-- **Work class**: Named unit (e.g., `kafka.topic.myTopic`) with configured parallelism `P`.
-- **Slot**: Logical shard within a work class, indexed `0..P-1`.
-- **Ownership**: Lease in Redis at `lease:<slotKey>` with TTL/renewal.
-- **Assignment**: Rendezvous hashing picks the desired owner from current live nodes.
-- **Stability**: Gentle handoff, cooldowns, rate limits, and backoff prevent thrash.
+- HRW/weighted HRW for deterministic desired owners across live nodes; weights can be static or provided dynamically.
+- Redis keys: `node:<id>` heartbeat with TTL, `nodes:all` membership set, `lease:<topic>:<slot>` with TTL, and `moved:<topic>:<slot>` cooldown markers.
+- Acquisition only touches unowned desired slots (`SET ... NX EX`); healthy leases are not preempted.
+- Fast recovery when leases expire; new nodes wait for natural release unless gentle handoff is enabled.
+- Stabilizers: cooldown per slot, minimum runtime per consumer, Redis backoff gates, per-pod and per-topic caps, optional Kafka oversubscription gate, and rate-limited shedding.
+- Lua scripts (compare-and-set renew/release) live in `internal/redis_scripts` and are exercised in tests with miniredis.
 
-## Redis backend
+## Config highlights (defaults from `DefaultConfig()`)
 
-- Uses simple keys and Lua scripts for safe renew/release.
-- Supports plain Redis or Sentinel via `UniversalClient`.
-- Config cache lives under `cfg:<workClass>`.
+| Field | Default | Notes |
+| --- | --- | --- |
+| `HeartbeatTTL` | 120s | TTL for `node:<id>` keys |
+| `HeartbeatInterval` | 10s | refresh cadence + membership `SADD` |
+| `LeaseTTL` | 90s | slot lease TTL |
+| `LeaseRenewInterval` | 30s | renewed via Lua compare-and-expire |
+| `ReconcileInterval` | 22s | desired assignment + acquisition/shedding |
+| `ReconcileJitter` | 0.15 | spreads thundering herds |
+| `SlotMoveCooldown` | 5m | cooldown key `moved:<topic>:<slot>` after moves |
+| `MinConsumerRuntime` | 90s | no voluntary shedding before this runtime |
+| `SheddingEnabled` | true | gentle handoff of undesired slots |
+| `SheddingRelease` | 2 | max voluntary releases per reconcile |
+| `MaxConsumersPerPod` | 0 | pod-wide cap (0 = unlimited) |
+| `MaxConsumersPerTopicPerPod` | 0 | per-topic cap per pod |
+| `RedisBackoff` | 45s | backoff window on Redis instability |
+| `ConfigWatchChannel` | `cfg:updates` | optional pubsub push for topic configs |
+
+All knobs are exposed on `Config`; validate with `Validate()` before wiring up a controller.
+
+## Stabilizers in practice
+
+- **Cooldowns:** when a slot is acquired, `moved:<topic>:<slot>` is written with a TTL. HRW-desired nodes skip taking over healthy leases during cooldown; fast recovery still happens when leases expire.
+- **Minimum runtime:** consumers are not shed until they have been alive for `MinConsumerRuntime`.
+- **Backoff:** Redis errors trigger a backoff window that halts acquisition/shedding but continues renewals. Consumers stop only when a renew fails.
+- **Caps:** `MaxConsumersPerPod` and `MaxConsumersPerTopicPerPod` gate acquisition; shedding will not drive below `MinConsumersPerPod`.
+- **Shedding:** optional and rate-limited (`SheddingRelease` per interval); uses compare-and-delete Lua to avoid races.
+
+## Chaos playground
+
+An interactive chaos lab that runs real controllers against an in-process Redis by default:
+
+```
+go run ./cmd/playground            # simulated Redis/Kafka-free mode
+go run ./cmd/playground -mode=real -redis=host:6379
+```
+
+Dashboard shows nodes, weights, owned counts, backoff state, slot ownership matrix, churn/min, caps, and convergence %. Commands: `add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `scenario <name>`, `load <file>`. Built-in scenarios cover scale-out smoothness, pod death storm, redis instability, weight skew, cross-cluster collisions, and lease flapping. Scenario files are simple YAML/JSON lists of timed commands.
+
+## Architecture
+
+See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendez` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `cmd/playground`).
 
 ## Testing
 
 ```
 go test ./...
-go test -race ./...   # optional but recommended locally
 ```
-
-## Roadmap
-
-- Expand chaos playground with scripted scenarios.
-- Add Prometheus metrics helpers.
-- Add etcd/Consul store implementations.
-- More integration tests with Docker Redis.
-
-## Non-goals
-
-- Exactly-once processing: make your slot work idempotent.
-- Perfect partition tolerance: behavior follows best effort with Redis TTLs.

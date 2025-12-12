@@ -1,4 +1,4 @@
-package workdist
+package rendez
 
 import (
 	"crypto/rand"
@@ -9,7 +9,12 @@ import (
 	"sync"
 )
 
-// DefaultNodeIDProvider builds stable node IDs from environment and host info.
+// NodeIDProvider builds stable node identifiers.
+type NodeIDProvider interface {
+	NodeID() (string, error)
+}
+
+// DefaultNodeIDProvider builds node IDs from host/env information.
 type DefaultNodeIDProvider struct {
 	prefix    string
 	addSuffix bool
@@ -19,10 +24,10 @@ type DefaultNodeIDProvider struct {
 	err  error
 }
 
-// DefaultNodeIDOption mutates DefaultNodeIDProvider construction.
+// DefaultNodeIDOption mutates provider construction.
 type DefaultNodeIDOption func(*DefaultNodeIDProvider)
 
-// WithNodePrefix adds a prefix to node IDs (useful for clusters/regions).
+// WithNodePrefix sets a prefix (e.g., cluster or region).
 func WithNodePrefix(prefix string) DefaultNodeIDOption {
 	return func(p *DefaultNodeIDProvider) {
 		p.prefix = prefix

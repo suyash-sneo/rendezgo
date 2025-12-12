@@ -1,16 +1,8 @@
-## Chaos playground (local)
-
-Spin up Redis:
+This directory is kept for backward compatibility. The interactive chaos playground now lives at `cmd/playground`:
 
 ```
-cd playground
-docker-compose up -d
+go run ./cmd/playground            # simulated mode with in-process Redis
+go run ./cmd/playground -mode=real -redis=127.0.0.1:6379
 ```
 
-Run multiple workers in one process:
-
-```
-go run ./cmd/chaos -nodes=3 -work-class=topic.demo -parallelism=6 -v
-```
-
-Watch logs to see slot ownership shift as you start/stop the process. Adjust flags to explore different parallelism and node counts.
+Use `help` inside the REPL for commands and scenarios.

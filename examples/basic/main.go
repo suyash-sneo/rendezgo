@@ -8,12 +8,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/you/workdist"
-	"github.com/you/workdist/coord/redis"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/suyash-sneo/rendez/pkg/rendez"
 )
 
 type demoRunner struct {
-	slot workdist.Slot
+	slot rendez.Slot
 }
 
 func (r *demoRunner) Run(ctx context.Context) error {
@@ -32,7 +33,7 @@ func (r *demoRunner) Stop(ctx context.Context) error { return nil }
 
 type demoFactory struct{}
 
-func (f *demoFactory) NewSlotRunner(slot workdist.Slot) (workdist.SlotRunner, error) {
+func (demoFactory) NewConsumer(slot rendez.Slot) (rendez.Consumer, error) {
 	return &demoRunner{slot: slot}, nil
 }
 
@@ -40,21 +41,20 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := redis.New(redis.Options{Addr: "127.0.0.1:6379"})
-	if err != nil {
-		log.Fatalf("redis store: %v", err)
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	cfg := rendez.DefaultConfig()
+	cfg.ClusterID = "example"
+	cfg.NodeID = "basic"
+	cfg.StaticTopics = []rendez.TopicConfig{
+		{Name: "topic.A", Partitions: 2},
 	}
-	provider := workdist.NewStaticParallelismProvider(map[string]int{
-		"topic.A": 2,
-	})
 
-	cfg := workdist.DefaultConfig()
-	coord, err := workdist.NewCoordinator(cfg, store, provider, &demoFactory{}, workdist.NewDefaultNodeIDProvider(), workdist.NopLogger(), workdist.NopMetrics())
+	ctrl, err := rendez.NewController(cfg, client, demoFactory{}, rendez.NopLogger(), rendez.NopMetrics())
 	if err != nil {
-		log.Fatalf("coordinator: %v", err)
+		log.Fatalf("controller: %v", err)
 	}
-	if err := coord.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Printf("coordinator exited: %v", err)
+	if err := ctrl.Start(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("controller exited: %v", err)
 		os.Exit(1)
 	}
 }

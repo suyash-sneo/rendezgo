@@ -2,41 +2,42 @@
 
 ## Overview
 
-Each node runs a coordinator that competes for logical slots using Redis as the coordination store. Desired ownership is determined via rendezvous (highest-random-weight) hashing across the live node set. Ownership is represented by a lease key with TTL and conditional renew/release semantics.
+`pkg/rendez` exposes a single `Controller` that runs inside each pod. The controller keeps a heartbeat in Redis, watches topic configs, computes desired ownership with weighted rendezvous hashing, and acquires only unowned desired slots. Renewals use Lua compare-and-expire scripts; releases use compare-and-delete. The design favors liveness with bounded churn and no hard stealing.
 
-## Key data
+## Key Redis data
 
-- `node:<nodeID>`: heartbeat key with TTL.
-- `nodes:all`: set of known node IDs.
-- `lease:<slotKey>`: slot ownership lease storing the owner node ID.
-- `cfg:<workClass>`: cached parallelism config for a work class.
+- `node:<nodeID>`: heartbeat value `cluster|node` with TTL.
+- `nodes:all`: set of known node IDs (cluster-specific sets are also maintained).
+- `lease:<topic>:<slot>`: slot lease storing the owner nodeID with TTL.
+- `moved:<topic>:<slot>`: cooldown marker with TTL set on successful acquire/release.
+- `cfg:<topic>` + `cfg:topics`: optional topic config cache; updates can be pushed via `cfg:updates` pubsub.
 
 ## Loops
 
-- **Heartbeat**: refresh `node:<nodeID>` and ensure membership.
-- **Reconcile**: list nodes, fetch work classes, compute desired slots via HRW, acquire missing leases up to `MaxAcquirePerTick`, optionally release undesired slots using gentle handoff.
-- **Renew**: periodically renew held leases; if renew fails, stop the local runner.
+- **Heartbeat loop**: refresh `node:<id>` + `SADD nodes:all` at `HeartbeatInterval`.
+- **Config cache loop**: subscribe to `ConfigWatchChannel` (optional) and periodically reload topic configs or fall back to static configs.
+- **Reconcile loop**: every `ReconcileInterval` (+ jitter) gather live nodes, compute desired slots via HRW, enforce caps, acquire only unowned desired slots (no stealing), and optionally shed undesired slots subject to cooldown, min runtime, health, and rate limits.
+- **Renew loop**: run Lua renew for each owned lease; loss stops the consumer immediately.
 
-## Stability features
+## Stabilizers
 
-- Gentle handoff releases only undesired slots, capped by `ReleasePerMinute`.
-- Cooldowns prevent rapid reacquire/release cycles.
-- Minimum runtime per slot guards against flapping immediately after a move.
-- Per-node and per-class caps bound resource usage.
-- Exponential backoff config is exposed for store errors (not fully wired yet).
+- **Cooldown per slot**: `moved:<topic>:<slot>` blocks voluntary takeover of healthy leases; fast recovery still allowed on expiry.
+- **Minimum runtime**: consumers are not shed until `MinConsumerRuntime` elapses.
+- **Redis backoff**: Redis timeouts/errors trigger a backoff window where acquisition/shedding are paused but renewals continue.
+- **Caps**: `MaxConsumersPerPod`, `MaxConsumersPerTopicPerPod`, and `MinConsumersPerPod` guard acquisition and shedding.
+- **Gentle handoff**: rate-limited shedding of undesired slots via compare-and-delete Lua; never steals.
+- **Weights**: HRW weights can be static or provided dynamically to bias ownership by capacity.
+- **Kafka gate** (optional): user-provided check to halt acquisition when consumer groups are oversubscribed.
 
-## Backends
+## Packages and binaries
 
-Redis implements the `coord.Store` interface using simple SET/GET and Lua scripts for renew/release. The interface keeps Redis-specific details out of the coordinator to allow future etcd/Consul backends.
+- `pkg/rendez`: public API (`Config`, `Controller`, `OwnedSlots`, interfaces for Redis client, consumer factory, logger, metrics, weight/health/Kafka hooks).
+- `internal/redis_scripts`: Lua for renew/release with sha helpers.
+- `cmd/rendez-agent`: example binary that wires a controller to Redis with a simple consumer factory.
+- `cmd/playground`: interactive chaos playground (simulated Redis by default, real mode available) with scenarios and live dashboard.
 
 ## Failure semantics
 
-- If Redis is unavailable, existing runners keep working until renew fails; new leases are not acquired.
-- Lease loss triggers runner shutdown.
-- Network partitions can lead to brief double-ownership until TTL expiry; design favors liveness with bounded staleness.
-
-## Extensibility
-
-- HRW hashing lives in `hash/` and can be swapped for weighted HRW later.
-- Parallelism provider is pluggable; the default cached provider falls back to user logic when the store misses.
-- Metrics and logging use lightweight interfaces for easy adapter hooks.
+- If Redis is unreachable, acquisition/shedding stop and backoff activates; renewals keep running until leases expire.
+- Lease loss stops the consumer promptly.
+- Node removal is detected via heartbeat TTL expiry; HRW recalculation plus cooldown/shedding handles reassignment without stealing.

@@ -1,6 +1,6 @@
 ## Contributing
 
-Thanks for helping make workdist better!
+Thanks for helping make rendez better!
 
 1. Run `gofmt` on touched files.
 2. Add tests for new behavior.
