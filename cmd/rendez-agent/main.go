@@ -13,7 +13,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/suyash-sneo/rendezgo/pkg/rendez"
+	"github.com/suyash-sneo/rendezgo/pkg/rendezgo"
 )
 
 func main() {
@@ -34,10 +34,10 @@ func main() {
 
 	workloads := parseWorkloads(workloadsFlag)
 	if len(workloads) == 0 {
-		workloads = []rendez.WorkloadConfig{{Name: "demo", Units: 4}}
+		workloads = []rendezgo.WorkloadConfig{{Name: "demo", Units: 4}}
 	}
 
-	cfg := rendez.DefaultConfig()
+	cfg := rendezgo.DefaultConfig()
 	cfg.ClusterID = clusterID
 	cfg.NodeID = nodeID
 	cfg.StaticWorkloads = workloads
@@ -46,7 +46,7 @@ func main() {
 	logger := stdLogger{verbose: verbose}
 	factory := logConsumerFactory{logger: logger}
 
-	ctrl, err := rendez.NewController(cfg, client, factory, logger, rendez.NopMetrics())
+	ctrl, err := rendezgo.NewController(cfg, client, factory, logger, rendezgo.NopMetrics())
 	if err != nil {
 		log.Fatalf("controller: %v", err)
 	}
@@ -58,9 +58,9 @@ func main() {
 	}
 }
 
-func parseWorkloads(flagVal string) []rendez.WorkloadConfig {
+func parseWorkloads(flagVal string) []rendezgo.WorkloadConfig {
 	parts := strings.Split(flagVal, ",")
-	var workloads []rendez.WorkloadConfig
+	var workloads []rendezgo.WorkloadConfig
 	for _, p := range parts {
 		if strings.TrimSpace(p) == "" {
 			continue
@@ -74,7 +74,7 @@ func parseWorkloads(flagVal string) []rendez.WorkloadConfig {
 		if units <= 0 {
 			continue
 		}
-		workloads = append(workloads, rendez.WorkloadConfig{Name: kv[0], Units: units})
+		workloads = append(workloads, rendezgo.WorkloadConfig{Name: kv[0], Units: units})
 	}
 	return workloads
 }
@@ -94,21 +94,21 @@ type stdLogger struct {
 	verbose bool
 }
 
-func (l stdLogger) Debug(msg string, fields ...rendez.Field) {
+func (l stdLogger) Debug(msg string, fields ...rendezgo.Field) {
 	if l.verbose {
 		log.Print(format(msg, fields...))
 	}
 }
 
-func (l stdLogger) Info(msg string, fields ...rendez.Field) { log.Print(format(msg, fields...)) }
-func (l stdLogger) Warn(msg string, fields ...rendez.Field) {
+func (l stdLogger) Info(msg string, fields ...rendezgo.Field) { log.Print(format(msg, fields...)) }
+func (l stdLogger) Warn(msg string, fields ...rendezgo.Field) {
 	log.Print("WARN: " + format(msg, fields...))
 }
-func (l stdLogger) Error(msg string, fields ...rendez.Field) {
+func (l stdLogger) Error(msg string, fields ...rendezgo.Field) {
 	log.Print("ERROR: " + format(msg, fields...))
 }
 
-func format(msg string, fields ...rendez.Field) string {
+func format(msg string, fields ...rendezgo.Field) string {
 	if len(fields) == 0 {
 		return msg
 	}
@@ -120,16 +120,16 @@ func format(msg string, fields ...rendez.Field) string {
 }
 
 type logConsumerFactory struct {
-	logger rendez.Logger
+	logger rendezgo.Logger
 }
 
-func (f logConsumerFactory) NewConsumer(slot rendez.Slot) (rendez.Consumer, error) {
-	f.logger.Info("starting consumer", rendez.Field{Key: "slot", Value: slot.Key()})
+func (f logConsumerFactory) NewConsumer(slot rendezgo.Slot) (rendezgo.Consumer, error) {
+	f.logger.Info("starting consumer", rendezgo.Field{Key: "slot", Value: slot.Key()})
 	return &logConsumer{logger: f.logger, slot: slot.Key()}, nil
 }
 
 type logConsumer struct {
-	logger rendez.Logger
+	logger rendezgo.Logger
 	slot   string
 }
 
@@ -141,12 +141,12 @@ func (c *logConsumer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			c.logger.Debug("consuming", rendez.Field{Key: "slot", Value: c.slot})
+			c.logger.Debug("consuming", rendezgo.Field{Key: "slot", Value: c.slot})
 		}
 	}
 }
 
 func (c *logConsumer) Stop(ctx context.Context) error {
-	c.logger.Info("stopping consumer", rendez.Field{Key: "slot", Value: c.slot})
+	c.logger.Info("stopping consumer", rendezgo.Field{Key: "slot", Value: c.slot})
 	return nil
 }

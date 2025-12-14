@@ -24,7 +24,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 
-	"github.com/suyash-sneo/rendezgo/pkg/rendez"
+	"github.com/suyash-sneo/rendezgo/pkg/rendezgo"
 )
 
 func main() {
@@ -48,7 +48,7 @@ func main() {
 
 	workloads := parseWorkloads(workloadsFlag)
 	if len(workloads) == 0 {
-		workloads = []rendez.WorkloadConfig{{Name: "demo", Units: 8}}
+		workloads = []rendezgo.WorkloadConfig{{Name: "demo", Units: 8}}
 	}
 	if dashboardInterval <= 0 {
 		dashboardInterval = time.Second
@@ -95,8 +95,8 @@ func main() {
 }
 
 type simulation struct {
-	template  rendez.Config
-	workloads []rendez.WorkloadConfig
+	template  rendezgo.Config
+	workloads []rendezgo.WorkloadConfig
 
 	mu        sync.Mutex
 	nodes     map[string]*simNode
@@ -118,7 +118,7 @@ type simNode struct {
 	id      string
 	weight  float64
 	cancel  context.CancelFunc
-	ctrl    *rendez.Controller
+	ctrl    *rendezgo.Controller
 	client  *redis.Client
 	hook    *chaosHook
 	health  *healthGate
@@ -126,12 +126,12 @@ type simNode struct {
 }
 
 type unitState struct {
-	slot        rendez.Slot
+	slot        rendezgo.Slot
 	owner       string
 	desired     string
 	leaseTTL    time.Duration
 	cooldownTTL time.Duration
-	ranking     []rendez.NodeScore
+	ranking     []rendezgo.NodeScore
 }
 
 type workloadCounts struct {
@@ -150,8 +150,8 @@ type nodeSummary struct {
 	workload map[string]workloadCounts
 }
 
-func newSimulation(ctx context.Context, mode, redisAddr string, workloads []rendez.WorkloadConfig) (*simulation, error) {
-	cfg := rendez.DefaultConfig()
+func newSimulation(ctx context.Context, mode, redisAddr string, workloads []rendezgo.WorkloadConfig) (*simulation, error) {
+	cfg := rendezgo.DefaultConfig()
 	cfg.ClusterID = "sim"
 	cfg.ReconcileInterval = 2 * time.Second
 	cfg.ReconcileJitter = 0.1
@@ -212,7 +212,7 @@ func (s *simulation) spawnNode(customID string, weight float64) string {
 	client.AddHook(hook)
 	health := &healthGate{healthy: true}
 	factory := &playConsumerFactory{}
-	ctrl, err := rendez.NewController(cfg, client, factory, rendez.NopLogger(), rendez.NopMetrics(), rendez.WithWeightProvider(s.weights), rendez.WithHealthChecker(health))
+	ctrl, err := rendezgo.NewController(cfg, client, factory, rendezgo.NopLogger(), rendezgo.NopMetrics(), rendezgo.WithWeightProvider(s.weights), rendezgo.WithHealthChecker(health))
 	if err != nil {
 		fmt.Printf("add node: %v\n", err)
 		return ""
@@ -312,22 +312,22 @@ func (s *simulation) setHealth(id string, healthy bool) {
 	node.healthy = healthy
 }
 
-func (s *simulation) sortedWorkloads() []rendez.WorkloadConfig {
-	byName := make(map[string]rendez.WorkloadConfig, len(s.workloads))
+func (s *simulation) sortedWorkloads() []rendezgo.WorkloadConfig {
+	byName := make(map[string]rendezgo.WorkloadConfig, len(s.workloads))
 	names := make([]string, 0, len(s.workloads))
 	for _, wl := range s.workloads {
 		byName[wl.Name] = wl
 		names = append(names, wl.Name)
 	}
 	sort.Strings(names)
-	out := make([]rendez.WorkloadConfig, 0, len(names))
+	out := make([]rendezgo.WorkloadConfig, 0, len(names))
 	for _, name := range names {
 		out = append(out, byName[name])
 	}
 	return out
 }
 
-func (s *simulation) liveNodeWeights(exclude string) []rendez.NodeWeight {
+func (s *simulation) liveNodeWeights(exclude string) []rendezgo.NodeWeight {
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.nodes))
 	for id := range s.nodes {
@@ -339,13 +339,13 @@ func (s *simulation) liveNodeWeights(exclude string) []rendez.NodeWeight {
 	s.mu.Unlock()
 	sort.Strings(ids)
 	snapshot := s.weights.Snapshot()
-	out := make([]rendez.NodeWeight, 0, len(ids))
+	out := make([]rendezgo.NodeWeight, 0, len(ids))
 	for _, id := range ids {
 		w := snapshot[id]
 		if w == 0 {
 			w = 1
 		}
-		out = append(out, rendez.NodeWeight{ID: id, Weight: w})
+		out = append(out, rendezgo.NodeWeight{ID: id, Weight: w})
 	}
 	return out
 }
@@ -361,7 +361,7 @@ func (s *simulation) redisState() (map[string]string, map[string]time.Duration, 
 	coolCmds := map[string]*redis.DurationCmd{}
 	for _, wl := range s.sortedWorkloads() {
 		for unit := 0; unit < wl.Units; unit++ {
-			slot := rendez.Slot{Workload: wl.Name, Unit: unit}
+			slot := rendezgo.Slot{Workload: wl.Name, Unit: unit}
 			key := leaseKeyLocal(slot)
 			leaseCmds[key] = pipe.Get(ctx, key)
 			ttlCmds[key] = pipe.PTTL(ctx, key)
@@ -390,13 +390,13 @@ func (s *simulation) redisState() (map[string]string, map[string]time.Duration, 
 	return owners, leaseTTLs, cooldownTTLs
 }
 
-func (s *simulation) buildUnitStates(weights []rendez.NodeWeight) []unitState {
-	desired := rendez.DesiredOwners(s.workloads, weights)
+func (s *simulation) buildUnitStates(weights []rendezgo.NodeWeight) []unitState {
+	desired := rendezgo.DesiredOwners(s.workloads, weights)
 	owners, leaseTTLs, cooldownTTLs := s.redisState()
 	states := make([]unitState, 0)
 	for _, wl := range s.sortedWorkloads() {
 		for unit := 0; unit < wl.Units; unit++ {
-			slot := rendez.Slot{Workload: wl.Name, Unit: unit}
+			slot := rendezgo.Slot{Workload: wl.Name, Unit: unit}
 			key := leaseKeyLocal(slot)
 			states = append(states, unitState{
 				slot:        slot,
@@ -404,7 +404,7 @@ func (s *simulation) buildUnitStates(weights []rendez.NodeWeight) []unitState {
 				desired:     desired[key],
 				leaseTTL:    leaseTTLs[key],
 				cooldownTTL: cooldownTTLs[key],
-				ranking:     rendez.RendezvousRanking(slot, weights),
+				ranking:     rendezgo.RendezvousRanking(slot, weights),
 			})
 		}
 	}
@@ -572,9 +572,9 @@ func (s *simulation) predictDown(rl *readline.Instance, target string) {
 		fmt.Fprintf(rl.Stdout(), "node %s not found\n", target)
 		return
 	}
-	currentDesired := rendez.DesiredOwners(s.workloads, full)
-	predicted := rendez.DesiredOwners(s.workloads, remaining)
-	moved := make([]rendez.Slot, 0)
+	currentDesired := rendezgo.DesiredOwners(s.workloads, full)
+	predicted := rendezgo.DesiredOwners(s.workloads, remaining)
+	moved := make([]rendezgo.Slot, 0)
 	for key, newOwner := range predicted {
 		if currentDesired[key] != newOwner {
 			slot, err := slotFromLeaseKey(key)
@@ -592,15 +592,15 @@ func (s *simulation) predictDown(rl *readline.Instance, target string) {
 	fmt.Fprintf(rl.Stdout(), "predicting %s down (%d slots affected):\n", target, len(moved))
 	for _, slot := range moved {
 		key := leaseKeyLocal(slot)
-		ranking := rendez.RendezvousRanking(slot, remaining)
+		ranking := rendezgo.RendezvousRanking(slot, remaining)
 		fmt.Fprintf(rl.Stdout(), "  %s[%d]: %s -> %s candidates: %s\n", slot.Workload, slot.Unit, shortOwner(currentDesired[key]), shortOwner(predicted[key]), formatRanking(ranking, s.topK))
 	}
 }
 
 func (s *simulation) explainUnit(rl *readline.Instance, workload string, unit int) {
 	weights := s.liveNodeWeights("")
-	slot := rendez.Slot{Workload: workload, Unit: unit}
-	ranking := rendez.RendezvousRanking(slot, weights)
+	slot := rendezgo.Slot{Workload: workload, Unit: unit}
+	ranking := rendezgo.RendezvousRanking(slot, weights)
 	if len(ranking) == 0 {
 		fmt.Fprintln(rl.Stdout(), "no candidates found")
 		return
@@ -861,7 +861,7 @@ func (s *simulation) runScenario(ctx context.Context, name string, rl *readline.
 		hook := &chaosHook{}
 		client.AddHook(hook)
 		health := &healthGate{healthy: true}
-		ctrl, _ := rendez.NewController(cfg, client, &playConsumerFactory{}, rendez.NopLogger(), rendez.NopMetrics(), rendez.WithWeightProvider(s.weights), rendez.WithHealthChecker(health))
+		ctrl, _ := rendezgo.NewController(cfg, client, &playConsumerFactory{}, rendezgo.NopLogger(), rendezgo.NopMetrics(), rendezgo.WithWeightProvider(s.weights), rendezgo.WithHealthChecker(health))
 		s.weights.Set(cfg.ClusterID+":"+cfg.NodeID, 1)
 		nodeCtx, cancel := context.WithCancel(ctx)
 		go ctrl.Start(nodeCtx)
@@ -949,13 +949,13 @@ func (s *simulation) nodeIDs() []string {
 func (s *simulation) logSummary(label string) {
 	weights := s.liveNodeWeights("")
 	owners, _, _ := s.redisState()
-	desired := rendez.DesiredOwners(s.workloads, weights)
+	desired := rendezgo.DesiredOwners(s.workloads, weights)
 	total := 0
 	matches := 0
 	dist := map[string]int{}
 	for _, wl := range s.workloads {
 		for i := 0; i < wl.Units; i++ {
-			slot := rendez.Slot{Workload: wl.Name, Unit: i}
+			slot := rendezgo.Slot{Workload: wl.Name, Unit: i}
 			key := leaseKeyLocal(slot)
 			owner := owners[key]
 			if owner != "" {
@@ -976,7 +976,7 @@ func (s *simulation) logSummary(label string) {
 
 type playConsumerFactory struct{}
 
-func (playConsumerFactory) NewConsumer(slot rendez.Slot) (rendez.Consumer, error) {
+func (playConsumerFactory) NewConsumer(slot rendezgo.Slot) (rendezgo.Consumer, error) {
 	return &playConsumer{slot: slot.Key()}, nil
 }
 
@@ -1095,24 +1095,24 @@ type scenarioEvent struct {
 	Command string `json:"command" yaml:"command"`
 }
 
-func leaseKeyLocal(slot rendez.Slot) string {
+func leaseKeyLocal(slot rendezgo.Slot) string {
 	return fmt.Sprintf("lease:%s:%d", slot.Workload, slot.Unit)
 }
 
-func movedKeyLocal(slot rendez.Slot) string {
+func movedKeyLocal(slot rendezgo.Slot) string {
 	return fmt.Sprintf("moved:%s:%d", slot.Workload, slot.Unit)
 }
 
-func slotFromLeaseKey(key string) (rendez.Slot, error) {
+func slotFromLeaseKey(key string) (rendezgo.Slot, error) {
 	parts := strings.Split(key, ":")
 	if len(parts) != 3 || parts[0] != "lease" {
-		return rendez.Slot{}, fmt.Errorf("invalid lease key %s", key)
+		return rendezgo.Slot{}, fmt.Errorf("invalid lease key %s", key)
 	}
 	unit, err := strconv.Atoi(parts[2])
 	if err != nil {
-		return rendez.Slot{}, err
+		return rendezgo.Slot{}, err
 	}
-	return rendez.Slot{Workload: parts[1], Unit: unit}, nil
+	return rendezgo.Slot{Workload: parts[1], Unit: unit}, nil
 }
 
 func formatTTL(d time.Duration) string {
@@ -1125,7 +1125,7 @@ func formatTTL(d time.Duration) string {
 	return d.Round(time.Millisecond).String()
 }
 
-func formatRanking(ranking []rendez.NodeScore, limit int) string {
+func formatRanking(ranking []rendezgo.NodeScore, limit int) string {
 	if len(ranking) == 0 {
 		return "none"
 	}
@@ -1163,9 +1163,9 @@ func signalContext() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-func parseWorkloads(flagVal string) []rendez.WorkloadConfig {
+func parseWorkloads(flagVal string) []rendezgo.WorkloadConfig {
 	parts := strings.Split(flagVal, ",")
-	var workloads []rendez.WorkloadConfig
+	var workloads []rendezgo.WorkloadConfig
 	for _, p := range parts {
 		if strings.TrimSpace(p) == "" {
 			continue
@@ -1179,7 +1179,7 @@ func parseWorkloads(flagVal string) []rendez.WorkloadConfig {
 		if units <= 0 {
 			continue
 		}
-		workloads = append(workloads, rendez.WorkloadConfig{Name: kv[0], Units: units})
+		workloads = append(workloads, rendezgo.WorkloadConfig{Name: kv[0], Units: units})
 	}
 	return workloads
 }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-`pkg/rendez` exposes a single `Controller` that runs inside each node. The controller keeps a heartbeat in Redis, watches workload configs, computes desired ownership with weighted rendezvous hashing, and acquires only unowned desired units. Renewals use Lua compare-and-expire scripts; releases use compare-and-delete. The design favors liveness with bounded churn and no hard stealing.
+`pkg/rendezgo` exposes a single `Controller` that runs inside each node. The controller keeps a heartbeat in Redis, watches workload configs, computes desired ownership with weighted rendezvous hashing, and acquires only unowned desired units. Renewals use Lua compare-and-expire scripts; releases use compare-and-delete. The design favors liveness with bounded churn and no hard stealing.
 
 ## Key Redis data
 
@@ -30,7 +30,7 @@
 
 ## Packages and binaries
 
-- `pkg/rendez`: public API (`Config`, `Controller`, `OwnedSlots`, interfaces for Redis client, consumer factory, logger, metrics, weight/health hooks).
+- `pkg/rendezgo`: public API (`Config`, `Controller`, `OwnedSlots`, interfaces for Redis client, consumer factory, logger, metrics, weight/health hooks).
 - `internal/redis_scripts`: Lua for renew/release with sha helpers.
 - `cmd/rendez-agent`: example binary that wires a controller to Redis with a simple consumer factory.
 - `cmd/playground`: interactive chaos playground (simulated Redis by default, real mode available) with scenarios, live dashboard, and HRW explanations.

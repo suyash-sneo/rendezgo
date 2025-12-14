@@ -1,4 +1,4 @@
-package rendez
+package rendezgo
 
 import (
 	"math"

@@ -16,16 +16,16 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/suyash-sneo/rendezgo/pkg/rendez"
+	"github.com/suyash-sneo/rendezgo/pkg/rendezgo"
 )
 
 type printerFactory struct{}
 
-func (printerFactory) NewConsumer(slot rendez.Slot) (rendez.Consumer, error) {
+func (printerFactory) NewConsumer(slot rendezgo.Slot) (rendezgo.Consumer, error) {
 	return &printer{slot: slot}, nil
 }
 
-type printer struct{ slot rendez.Slot }
+type printer struct{ slot rendezgo.Slot }
 
 func (p *printer) Run(ctx context.Context) error {
 	t := time.NewTicker(2 * time.Second)
@@ -46,12 +46,12 @@ func main() {
 	defer cancel()
 
 	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-	cfg := rendez.DefaultConfig()
+	cfg := rendezgo.DefaultConfig()
 	cfg.ClusterID = "demo"
 	cfg.NodeID = "worker-1" // optional; defaults to hostname
-	cfg.StaticWorkloads = []rendez.WorkloadConfig{{Name: "inbox", Units: 4}}
+	cfg.StaticWorkloads = []rendezgo.WorkloadConfig{{Name: "inbox", Units: 4}}
 
-	ctrl, err := rendez.NewController(cfg, client, printerFactory{}, rendez.NopLogger(), rendez.NopMetrics())
+	ctrl, err := rendezgo.NewController(cfg, client, printerFactory{}, rendezgo.NopLogger(), rendezgo.NopMetrics())
 	if err != nil {
 		log.Fatalf("controller: %v", err)
 	}
@@ -117,7 +117,7 @@ Dashboard shows node weights/state, owned vs desired counts, per-workload breakd
 
 ## Architecture
 
-See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendez` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `cmd/playground`).
+See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendezgo` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `cmd/playground`).
 
 ## Testing
 
