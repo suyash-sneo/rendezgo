@@ -13,34 +13,34 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/suyash-sneo/rendez/pkg/rendez"
+	"github.com/suyash-sneo/rendezgo/pkg/rendez"
 )
 
 func main() {
 	var (
-		redisAddr  string
-		topicsFlag string
-		nodeID     string
-		clusterID  string
-		verbose    bool
+		redisAddr     string
+		workloadsFlag string
+		nodeID        string
+		clusterID     string
+		verbose       bool
 	)
 
 	flag.StringVar(&redisAddr, "redis", "127.0.0.1:6379", "redis address")
-	flag.StringVar(&topicsFlag, "topics", "demo:4", "topic=partitions pairs (comma-separated)")
+	flag.StringVar(&workloadsFlag, "workloads", "demo:4", "workload=units pairs (comma-separated)")
 	flag.StringVar(&nodeID, "node", "", "node id suffix (defaults to hostname)")
 	flag.StringVar(&clusterID, "cluster", "agent", "cluster id prefix")
 	flag.BoolVar(&verbose, "v", false, "verbose logging")
 	flag.Parse()
 
-	topics := parseTopics(topicsFlag)
-	if len(topics) == 0 {
-		topics = []rendez.TopicConfig{{Name: "demo", Partitions: 4}}
+	workloads := parseWorkloads(workloadsFlag)
+	if len(workloads) == 0 {
+		workloads = []rendez.WorkloadConfig{{Name: "demo", Units: 4}}
 	}
 
 	cfg := rendez.DefaultConfig()
 	cfg.ClusterID = clusterID
 	cfg.NodeID = nodeID
-	cfg.StaticTopics = topics
+	cfg.StaticWorkloads = workloads
 
 	client := redis.NewClient(&redis.Options{Addr: redisAddr})
 	logger := stdLogger{verbose: verbose}
@@ -58,9 +58,9 @@ func main() {
 	}
 }
 
-func parseTopics(flagVal string) []rendez.TopicConfig {
+func parseWorkloads(flagVal string) []rendez.WorkloadConfig {
 	parts := strings.Split(flagVal, ",")
-	var topics []rendez.TopicConfig
+	var workloads []rendez.WorkloadConfig
 	for _, p := range parts {
 		if strings.TrimSpace(p) == "" {
 			continue
@@ -69,14 +69,14 @@ func parseTopics(flagVal string) []rendez.TopicConfig {
 		if len(kv) != 2 {
 			continue
 		}
-		var partitions int
-		fmt.Sscanf(kv[1], "%d", &partitions)
-		if partitions <= 0 {
+		var units int
+		fmt.Sscanf(kv[1], "%d", &units)
+		if units <= 0 {
 			continue
 		}
-		topics = append(topics, rendez.TopicConfig{Name: kv[0], Partitions: partitions})
+		workloads = append(workloads, rendez.WorkloadConfig{Name: kv[0], Units: units})
 	}
-	return topics
+	return workloads
 }
 
 func signalContext() (context.Context, context.CancelFunc) {

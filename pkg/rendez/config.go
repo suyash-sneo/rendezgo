@@ -5,20 +5,11 @@ import (
 	"time"
 )
 
-// TopicConfig describes a topic and its slot parallelism.
-type TopicConfig struct {
+// WorkloadConfig describes a workload and its unit parallelism.
+type WorkloadConfig struct {
 	Name                string `json:"name" yaml:"name"`
-	Partitions          int    `json:"partitions" yaml:"partitions"`
-	MaxConsumersPerPod  int    `json:"maxConsumersPerPod,omitempty" yaml:"maxConsumersPerPod,omitempty"`
+	Units               int    `json:"units" yaml:"units"`
 	MaxConsumersPerNode int    `json:"maxConsumersPerNode,omitempty" yaml:"maxConsumersPerNode,omitempty"`
-}
-
-// KafkaCheckConfig controls the optional Kafka membership sanity gate.
-type KafkaCheckConfig struct {
-	Enabled                    bool
-	Interval                   time.Duration
-	OversubscriptionMultiplier float64
-	Threshold                  time.Duration
 }
 
 // Config captures all controller tunables.
@@ -33,10 +24,10 @@ type Config struct {
 	ReconcileInterval  time.Duration
 	ReconcileJitter    float64
 
-	ConfigRefreshInterval time.Duration
-	ConfigWatchChannel    string
-	ConfigKeyPrefix       string
-	TopicIndexKey         string
+	ConfigRefreshInterval   time.Duration
+	ConfigWatchChannel      string
+	WorkloadConfigKeyPrefix string
+	WorkloadIndexKey        string
 
 	GentleHandoff      bool
 	SheddingEnabled    bool
@@ -47,55 +38,47 @@ type Config struct {
 	RedisBackoff       time.Duration
 	RedisBackoffJitter float64
 
-	MaxConsumersPerPod         int
-	MaxConsumersPerTopicPerPod int
-	MinConsumersPerPod         int
-	AcquireLimit               int
+	MaxConsumersPerNode            int
+	MaxConsumersPerWorkloadPerNode int
+	MinConsumersPerNode            int
+	AcquireLimit                   int
 
 	HealthGracePeriod time.Duration
 	ReleaseOnShutdown bool
 
-	StaticTopics  []TopicConfig
-	StaticWeights map[string]float64
-	DefaultWeight float64
-
-	Kafka KafkaCheckConfig
+	StaticWorkloads []WorkloadConfig
+	StaticWeights   map[string]float64
+	DefaultWeight   float64
 }
 
 // DefaultConfig returns conservative defaults aligned with the spec.
 func DefaultConfig() Config {
 	return Config{
-		ClusterID:                  "default",
-		HeartbeatTTL:               120 * time.Second,
-		HeartbeatInterval:          10 * time.Second,
-		LeaseTTL:                   90 * time.Second,
-		LeaseRenewInterval:         30 * time.Second,
-		ReconcileInterval:          22 * time.Second,
-		ReconcileJitter:            0.15,
-		ConfigRefreshInterval:      30 * time.Second,
-		ConfigWatchChannel:         "cfg:updates",
-		ConfigKeyPrefix:            "cfg:",
-		TopicIndexKey:              "cfg:topics",
-		GentleHandoff:              true,
-		SheddingEnabled:            true,
-		SheddingRelease:            2,
-		MinConsumerRuntime:         90 * time.Second,
-		SlotMoveCooldown:           5 * time.Minute,
-		RedisBackoff:               45 * time.Second,
-		RedisBackoffJitter:         0.25,
-		MaxConsumersPerPod:         0, // unlimited
-		MaxConsumersPerTopicPerPod: 0,
-		MinConsumersPerPod:         0,
-		AcquireLimit:               16,
-		HealthGracePeriod:          5 * time.Second,
-		ReleaseOnShutdown:          true,
-		DefaultWeight:              1.0,
-		Kafka: KafkaCheckConfig{
-			Enabled:                    false,
-			Interval:                   1 * time.Minute,
-			OversubscriptionMultiplier: 1.5,
-			Threshold:                  20 * time.Second,
-		},
+		ClusterID:                      "default",
+		HeartbeatTTL:                   120 * time.Second,
+		HeartbeatInterval:              10 * time.Second,
+		LeaseTTL:                       90 * time.Second,
+		LeaseRenewInterval:             30 * time.Second,
+		ReconcileInterval:              22 * time.Second,
+		ReconcileJitter:                0.15,
+		ConfigRefreshInterval:          30 * time.Second,
+		ConfigWatchChannel:             "cfg:updates",
+		WorkloadConfigKeyPrefix:        "cfg:workload:",
+		WorkloadIndexKey:               "cfg:workloads",
+		GentleHandoff:                  true,
+		SheddingEnabled:                true,
+		SheddingRelease:                2,
+		MinConsumerRuntime:             90 * time.Second,
+		SlotMoveCooldown:               5 * time.Minute,
+		RedisBackoff:                   45 * time.Second,
+		RedisBackoffJitter:             0.25,
+		MaxConsumersPerNode:            0, // unlimited
+		MaxConsumersPerWorkloadPerNode: 0,
+		MinConsumersPerNode:            0,
+		AcquireLimit:                   16,
+		HealthGracePeriod:              5 * time.Second,
+		ReleaseOnShutdown:              true,
+		DefaultWeight:                  1.0,
 	}
 }
 
@@ -143,21 +126,21 @@ func (c Config) Validate() error {
 	if c.AcquireLimit < 0 {
 		return fmt.Errorf("acquire limit must be >=0")
 	}
-	if c.MaxConsumersPerPod < 0 || c.MaxConsumersPerTopicPerPod < 0 {
+	if c.MaxConsumersPerNode < 0 || c.MaxConsumersPerWorkloadPerNode < 0 {
 		return fmt.Errorf("consumer caps must be >=0")
 	}
-	if c.MinConsumersPerPod < 0 {
-		return fmt.Errorf("min consumers per pod must be >=0")
+	if c.MinConsumersPerNode < 0 {
+		return fmt.Errorf("min consumers per node must be >=0")
 	}
 	if c.DefaultWeight <= 0 {
 		return fmt.Errorf("default weight must be >0")
 	}
-	for _, t := range c.StaticTopics {
+	for _, t := range c.StaticWorkloads {
 		if t.Name == "" {
-			return fmt.Errorf("static topic missing name")
+			return fmt.Errorf("static workload missing name")
 		}
-		if t.Partitions <= 0 {
-			return fmt.Errorf("static topic %s partitions must be >0", t.Name)
+		if t.Units <= 0 {
+			return fmt.Errorf("static workload %s units must be >0", t.Name)
 		}
 	}
 	return nil

@@ -10,7 +10,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/suyash-sneo/rendez/pkg/rendez"
+	"github.com/suyash-sneo/rendezgo/pkg/rendez"
 )
 
 type demoRunner struct {
@@ -45,8 +45,8 @@ func main() {
 	cfg := rendez.DefaultConfig()
 	cfg.ClusterID = "example"
 	cfg.NodeID = "basic"
-	cfg.StaticTopics = []rendez.TopicConfig{
-		{Name: "topic.A", Partitions: 2},
+	cfg.StaticWorkloads = []rendez.WorkloadConfig{
+		{Name: "workload.A", Units: 2},
 	}
 
 	ctrl, err := rendez.NewController(cfg, client, demoFactory{}, rendez.NopLogger(), rendez.NopMetrics())

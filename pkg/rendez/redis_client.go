@@ -8,7 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/suyash-sneo/rendez/internal/redis_scripts"
+	"github.com/suyash-sneo/rendezgo/internal/redis_scripts"
 )
 
 // RedisClient is the minimal surface used by the controller.

@@ -7,15 +7,15 @@ import (
 	"strings"
 )
 
-// Slot identifies a topic partition pair.
+// Slot identifies a workload/unit pair.
 type Slot struct {
-	Topic string
-	Index int
+	Workload string
+	Unit     int
 }
 
 // Key returns the canonical key used for leases and cooldown markers.
 func (s Slot) Key() string {
-	return s.Topic + "|" + strconv.Itoa(s.Index)
+	return s.Workload + "|" + strconv.Itoa(s.Unit)
 }
 
 // SlotFromKey parses a slot key back into a Slot.
@@ -28,7 +28,7 @@ func SlotFromKey(key string) (Slot, error) {
 	if err != nil {
 		return Slot{}, fmt.Errorf("invalid slot index in %q: %w", key, err)
 	}
-	return Slot{Topic: parts[0], Index: idx}, nil
+	return Slot{Workload: parts[0], Unit: idx}, nil
 }
 
 // Consumer performs work for a slot.
@@ -50,11 +50,6 @@ type HealthChecker interface {
 // WeightProvider supplies dynamic node weights.
 type WeightProvider interface {
 	Weight(nodeID string) (float64, bool)
-}
-
-// KafkaMembershipChecker optionally guards acquisition when the consumer group is already oversubscribed.
-type KafkaMembershipChecker interface {
-	OverSubscribed(ctx context.Context, topic string, partitions int) bool
 }
 
 // Logger is a small structured logger.

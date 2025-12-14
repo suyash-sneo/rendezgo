@@ -1,6 +1,6 @@
-# rendez
+# rendezgo
 
-Distributed slot ownership for Go services without a central manager. Each node runs the same control loops, competes for leases in Redis, and uses weighted rendezvous hashing (HRW) to decide who _should_ own every `(topic, slot)` pair. No hard steals: healthy leases are left alone and ownership changes only through expiry or voluntary handoff.
+Distributed workload ownership for Go services without a central manager. Each node runs the same control loops, competes for leases in Redis, and uses weighted rendezvous hashing (HRW) to decide who _should_ own every `(workload, unit)` pair. No hard steals: healthy leases are left alone and ownership changes only through expiry or voluntary handoff.
 
 ## Quickstart
 
@@ -16,7 +16,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/suyash-sneo/rendez/pkg/rendez"
+	"github.com/suyash-sneo/rendezgo/pkg/rendez"
 )
 
 type printerFactory struct{}
@@ -48,8 +48,8 @@ func main() {
 	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
 	cfg := rendez.DefaultConfig()
 	cfg.ClusterID = "demo"
-	cfg.NodeID = "worker-1"          // optional; defaults to hostname
-	cfg.StaticTopics = []rendez.TopicConfig{{Name: "topicA", Partitions: 4}}
+	cfg.NodeID = "worker-1" // optional; defaults to hostname
+	cfg.StaticWorkloads = []rendez.WorkloadConfig{{Name: "inbox", Units: 4}}
 
 	ctrl, err := rendez.NewController(cfg, client, printerFactory{}, rendez.NopLogger(), rendez.NopMetrics())
 	if err != nil {
@@ -61,15 +61,15 @@ func main() {
 }
 ```
 
-Run multiple processes with the same Redis endpoint; slots will converge to the HRW owner set, recover quickly on pod death, and never steal healthy leases.
+Run multiple processes with the same Redis endpoint; units will converge to the HRW owner set, recover quickly on node death, and never steal healthy leases.
 
 ## Behavior and guarantees
 
 - HRW/weighted HRW for deterministic desired owners across live nodes; weights can be static or provided dynamically.
-- Redis keys: `node:<id>` heartbeat with TTL, `nodes:all` membership set, `lease:<topic>:<slot>` with TTL, and `moved:<topic>:<slot>` cooldown markers.
-- Acquisition only touches unowned desired slots (`SET ... NX EX`); healthy leases are not preempted.
+- Redis keys: `node:<id>` heartbeat with TTL, `nodes:all` membership set, `lease:<workload>:<unit>` with TTL, `moved:<workload>:<unit>` cooldown markers, `cfg:workloads` index, and `cfg:workload:<name>` for dynamic workload configs. PubSub channel remains `cfg:updates`.
+- Acquisition only touches unowned desired units (`SET ... NX EX`); healthy leases are not preempted.
 - Fast recovery when leases expire; new nodes wait for natural release unless gentle handoff is enabled.
-- Stabilizers: cooldown per slot, minimum runtime per consumer, Redis backoff gates, per-pod and per-topic caps, optional Kafka oversubscription gate, and rate-limited shedding.
+- Stabilizers: cooldown per unit, minimum runtime per consumer, Redis backoff gates, per-node and per-workload caps, and rate-limited shedding.
 - Lua scripts (compare-and-set renew/release) live in `internal/redis_scripts` and are exercised in tests with miniredis.
 
 ## Config highlights (defaults from `DefaultConfig()`)
@@ -78,27 +78,30 @@ Run multiple processes with the same Redis endpoint; slots will converge to the 
 | --- | --- | --- |
 | `HeartbeatTTL` | 120s | TTL for `node:<id>` keys |
 | `HeartbeatInterval` | 10s | refresh cadence + membership `SADD` |
-| `LeaseTTL` | 90s | slot lease TTL |
+| `LeaseTTL` | 90s | lease TTL |
 | `LeaseRenewInterval` | 30s | renewed via Lua compare-and-expire |
 | `ReconcileInterval` | 22s | desired assignment + acquisition/shedding |
 | `ReconcileJitter` | 0.15 | spreads thundering herds |
-| `SlotMoveCooldown` | 5m | cooldown key `moved:<topic>:<slot>` after moves |
+| `SlotMoveCooldown` | 5m | cooldown key `moved:<workload>:<unit>` after moves |
 | `MinConsumerRuntime` | 90s | no voluntary shedding before this runtime |
-| `SheddingEnabled` | true | gentle handoff of undesired slots |
+| `SheddingEnabled` | true | gentle handoff of undesired units |
 | `SheddingRelease` | 2 | max voluntary releases per reconcile |
-| `MaxConsumersPerPod` | 0 | pod-wide cap (0 = unlimited) |
-| `MaxConsumersPerTopicPerPod` | 0 | per-topic cap per pod |
+| `MaxConsumersPerNode` | 0 | node-wide cap (0 = unlimited) |
+| `MaxConsumersPerWorkloadPerNode` | 0 | per-workload cap per node |
+| `MinConsumersPerNode` | 0 | lower bound during shedding |
 | `RedisBackoff` | 45s | backoff window on Redis instability |
-| `ConfigWatchChannel` | `cfg:updates` | optional pubsub push for topic configs |
+| `ConfigWatchChannel` | `cfg:updates` | optional pubsub push for workload configs |
+| `WorkloadConfigKeyPrefix` | `cfg:workload:` | dynamic config key prefix |
+| `WorkloadIndexKey` | `cfg:workloads` | dynamic workload index set |
 
 All knobs are exposed on `Config`; validate with `Validate()` before wiring up a controller.
 
 ## Stabilizers in practice
 
-- **Cooldowns:** when a slot is acquired, `moved:<topic>:<slot>` is written with a TTL. HRW-desired nodes skip taking over healthy leases during cooldown; fast recovery still happens when leases expire.
+- **Cooldowns:** when a unit is acquired, `moved:<workload>:<unit>` is written with a TTL. HRW-desired nodes skip taking over healthy leases during cooldown; fast recovery still happens when leases expire.
 - **Minimum runtime:** consumers are not shed until they have been alive for `MinConsumerRuntime`.
 - **Backoff:** Redis errors trigger a backoff window that halts acquisition/shedding but continues renewals. Consumers stop only when a renew fails.
-- **Caps:** `MaxConsumersPerPod` and `MaxConsumersPerTopicPerPod` gate acquisition; shedding will not drive below `MinConsumersPerPod`.
+- **Caps:** `MaxConsumersPerNode` and `MaxConsumersPerWorkloadPerNode` gate acquisition; shedding will not drive below `MinConsumersPerNode`.
 - **Shedding:** optional and rate-limited (`SheddingRelease` per interval); uses compare-and-delete Lua to avoid races.
 
 ## Chaos playground
@@ -106,11 +109,11 @@ All knobs are exposed on `Config`; validate with `Validate()` before wiring up a
 An interactive chaos lab that runs real controllers against an in-process Redis by default:
 
 ```
-go run ./cmd/playground            # simulated Redis/Kafka-free mode
+go run ./cmd/playground                 # simulated Redis
 go run ./cmd/playground -mode=real -redis=host:6379
 ```
 
-Dashboard shows nodes, weights, owned counts, backoff state, slot ownership matrix, churn/min, caps, and convergence %. Commands: `add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `scenario <name>`, `load <file>`. Built-in scenarios cover scale-out smoothness, pod death storm, redis instability, weight skew, cross-cluster collisions, and lease flapping. Scenario files are simple YAML/JSON lists of timed commands.
+Dashboard shows node weights/state, owned vs desired counts, per-workload breakdowns, churn/min, caps, per-unit ownership/TTL/cooldown, and HRW candidate queues. Commands: `add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `focus <workload|none>`, `dashboard on|off`, `predict down <node>`, `explain <workload> <unit>`, `scenario <name>`, `load <file>`. Use `-workloads` (`name:units,...`) and `-dashboard-interval` flags to tune simulations. Scenario files are simple YAML/JSON lists of timed commands.
 
 ## Architecture
 

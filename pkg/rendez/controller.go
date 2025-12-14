@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,7 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/suyash-sneo/rendez/internal/redis_scripts"
+	"github.com/suyash-sneo/rendezgo/internal/redis_scripts"
 )
 
 type ControllerOption func(*Controller)
@@ -27,11 +28,6 @@ func WithHealthChecker(h HealthChecker) ControllerOption {
 // WithWeightProvider injects a dynamic weight source.
 func WithWeightProvider(w WeightProvider) ControllerOption {
 	return func(c *Controller) { c.weights = w }
-}
-
-// WithKafkaChecker injects a Kafka oversubscription gate.
-func WithKafkaChecker(k KafkaMembershipChecker) ControllerOption {
-	return func(c *Controller) { c.kafka = k }
 }
 
 // WithNodeIDProvider overrides the default node ID provider.
@@ -54,7 +50,6 @@ type Controller struct {
 
 	health    HealthChecker
 	weights   WeightProvider
-	kafka     KafkaMembershipChecker
 	nodeIDs   NodeIDProvider
 	now       func() time.Time
 	churnMu   sync.Mutex
@@ -66,12 +61,12 @@ type Controller struct {
 	renewScript   redisScript
 	releaseScript redisScript
 
-	mu      sync.RWMutex
-	owned   map[string]*consumerHandle
-	topics  map[string]TopicConfig
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started time.Time
+	mu        sync.RWMutex
+	owned     map[string]*consumerHandle
+	workloads map[string]WorkloadConfig
+	ctx       context.Context
+	cancel    context.CancelFunc
+	started   time.Time
 }
 
 type consumerHandle struct {
@@ -111,7 +106,7 @@ func NewController(cfg Config, redisClient RedisClient, consumerFactory Consumer
 		renewScript:   newRedisScript(redis_scripts.NewScript(redis_scripts.Renew)),
 		releaseScript: newRedisScript(redis_scripts.NewScript(redis_scripts.Release)),
 		owned:         map[string]*consumerHandle{},
-		topics:        map[string]TopicConfig{},
+		workloads:     map[string]WorkloadConfig{},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -157,7 +152,7 @@ func (c *Controller) OwnedSlots() map[string][]Slot {
 	defer c.mu.RUnlock()
 	out := make(map[string][]Slot, len(c.owned))
 	for _, h := range c.owned {
-		out[h.slot.Topic] = append(out[h.slot.Topic], h.slot)
+		out[h.slot.Workload] = append(out[h.slot.Workload], h.slot)
 	}
 	return out
 }
@@ -254,13 +249,13 @@ func (c *Controller) configLoop(ctx context.Context) {
 			if err := c.refreshConfigs(ctx); err != nil {
 				c.logger.Warn("config refresh failed", Field{Key: "err", Value: err})
 			}
-		case topic, ok := <-updates:
+		case workload, ok := <-updates:
 			if !ok {
 				updates = nil
 				continue
 			}
-			if err := c.refreshTopic(ctx, topic); err != nil {
-				c.logger.Warn("config refresh topic failed", Field{Key: "topic", Value: topic}, Field{Key: "err", Value: err})
+			if err := c.refreshWorkload(ctx, workload); err != nil {
+				c.logger.Warn("config refresh workload failed", Field{Key: "workload", Value: workload}, Field{Key: "err", Value: err})
 			}
 		}
 	}
@@ -289,53 +284,86 @@ func (c *Controller) reconcile(ctx context.Context) {
 		return
 	}
 
-	topics := c.topicSnapshot()
+	workloads := c.workloadSnapshot()
 	weights := c.weightsSnapshot(live)
+	weightByID := make(map[string]float64, len(weights))
+	for _, nw := range weights {
+		weightByID[nw.ID] = nw.Weight
+	}
+	selfWeight := weightByID[c.nodeID]
+	if selfWeight == 0 {
+		selfWeight = c.cfg.DefaultWeight
+	}
+
+	type desiredSlot struct {
+		slot  Slot
+		score float64
+	}
 	desired := make(map[string]Slot)
-	for _, cfg := range topics {
-		for i := 0; i < cfg.Partitions; i++ {
-			slot := Slot{Topic: cfg.Name, Index: i}
+	desiredList := make([]desiredSlot, 0)
+	names := make([]string, 0, len(workloads))
+	for name := range workloads {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		cfg := workloads[name]
+		for i := 0; i < cfg.Units; i++ {
+			slot := Slot{Workload: cfg.Name, Unit: i}
 			owner, ok := RendezvousOwner(slot, weights)
 			if !ok || owner != c.nodeID {
 				continue
 			}
 			desired[slot.Key()] = slot
+			desiredList = append(desiredList, desiredSlot{
+				slot:  slot,
+				score: weightedScore(slot.Key(), c.nodeID, selfWeight),
+			})
 		}
 	}
 
+	sort.Slice(desiredList, func(i, j int) bool {
+		if desiredList[i].score == desiredList[j].score {
+			if desiredList[i].slot.Workload == desiredList[j].slot.Workload {
+				return desiredList[i].slot.Unit < desiredList[j].slot.Unit
+			}
+			return desiredList[i].slot.Workload < desiredList[j].slot.Workload
+		}
+		return desiredList[i].score > desiredList[j].score
+	})
+
 	owned := c.ownedSnapshot()
-	podCount := len(owned)
-	topicCounts := make(map[string]int)
+	nodeCount := len(owned)
+	workloadCounts := make(map[string]int)
 	for _, h := range owned {
-		topicCounts[h.slot.Topic]++
+		workloadCounts[h.slot.Workload]++
 	}
 
-	topicCap := func(topic string) int {
-		capValue := c.cfg.MaxConsumersPerTopicPerPod
-		if tc, ok := topics[topic]; ok && tc.MaxConsumersPerPod > 0 {
-			if capValue == 0 || tc.MaxConsumersPerPod < capValue {
-				capValue = tc.MaxConsumersPerPod
+	workloadCap := func(workload string) int {
+		capValue := c.cfg.MaxConsumersPerWorkloadPerNode
+		if wc, ok := workloads[workload]; ok && wc.MaxConsumersPerNode > 0 {
+			if capValue == 0 || wc.MaxConsumersPerNode < capValue {
+				capValue = wc.MaxConsumersPerNode
 			}
 		}
 		return capValue
 	}
 
 	acquired := 0
-	for key, slot := range desired {
+	for _, candidate := range desiredList {
+		slot := candidate.slot
+		key := slot.Key()
 		if _, ok := owned[key]; ok {
 			continue
+		}
+		if c.cfg.MaxConsumersPerNode > 0 && nodeCount >= c.cfg.MaxConsumersPerNode {
+			break
 		}
 		if c.cfg.AcquireLimit > 0 && acquired >= c.cfg.AcquireLimit {
 			break
 		}
-		if c.cfg.MaxConsumersPerPod > 0 && podCount >= c.cfg.MaxConsumersPerPod {
-			break
-		}
-		capForTopic := topicCap(slot.Topic)
-		if capForTopic > 0 && topicCounts[slot.Topic] >= capForTopic {
-			continue
-		}
-		if c.cfg.Kafka.Enabled && c.kafka != nil && c.kafka.OverSubscribed(ctx, slot.Topic, topics[slot.Topic].Partitions) {
+		capForWorkload := workloadCap(slot.Workload)
+		if capForWorkload > 0 && workloadCounts[slot.Workload] >= capForWorkload {
 			continue
 		}
 		owner, ok, err := c.getLeaseOwner(ctx, slot)
@@ -366,8 +394,8 @@ func (c *Controller) reconcile(ctx context.Context) {
 		}
 		if ok {
 			acquired++
-			podCount++
-			topicCounts[slot.Topic]++
+			nodeCount++
+			workloadCounts[slot.Workload]++
 		}
 	}
 
@@ -385,16 +413,26 @@ func (c *Controller) shed(ctx context.Context, desired map[string]Slot) {
 		return
 	}
 	owned := c.ownedSnapshot()
-	topics := c.topicSnapshot()
+	ordered := make([]*consumerHandle, 0, len(owned))
+	for _, h := range owned {
+		ordered = append(ordered, h)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].slot.Workload == ordered[j].slot.Workload {
+			return ordered[i].slot.Unit < ordered[j].slot.Unit
+		}
+		return ordered[i].slot.Workload < ordered[j].slot.Workload
+	})
 	allowed := c.cfg.SheddingRelease
-	for key, handle := range owned {
+	for _, handle := range ordered {
+		key := handle.slot.Key()
 		if _, ok := desired[key]; ok {
 			continue
 		}
 		if allowed == 0 {
 			return
 		}
-		if c.cfg.MinConsumersPerPod > 0 && len(owned) <= c.cfg.MinConsumersPerPod {
+		if c.cfg.MinConsumersPerNode > 0 && len(owned) <= c.cfg.MinConsumersPerNode {
 			return
 		}
 		if c.cfg.MinConsumerRuntime > 0 && c.now().Sub(handle.startedAt) < c.cfg.MinConsumerRuntime {
@@ -402,11 +440,6 @@ func (c *Controller) shed(ctx context.Context, desired map[string]Slot) {
 		}
 		if c.cooldownActive(ctx, handle.slot) {
 			continue
-		}
-		if c.cfg.Kafka.Enabled && c.kafka != nil {
-			if cfg, ok := topics[handle.slot.Topic]; ok && c.kafka.OverSubscribed(ctx, handle.slot.Topic, cfg.Partitions) {
-				continue
-			}
 		}
 		allowed--
 		c.releaseSlot(ctx, handle.slot, "shedding")
@@ -514,7 +547,7 @@ func (c *Controller) startConsumer(slot Slot) error {
 	c.owned[slot.Key()] = handle
 	c.mu.Unlock()
 
-	c.metrics.IncCounter("rendez_consumer_start_total", 1, Label{Name: "topic", Value: slot.Topic})
+	c.metrics.IncCounter("rendez_consumer_start_total", 1, Label{Name: "workload", Value: slot.Workload})
 	go func() {
 		defer close(handle.done)
 		if err := consumer.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
@@ -534,81 +567,81 @@ func (c *Controller) ownedSnapshot() map[string]*consumerHandle {
 	return out
 }
 
-func (c *Controller) topicSnapshot() map[string]TopicConfig {
+func (c *Controller) workloadSnapshot() map[string]WorkloadConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make(map[string]TopicConfig, len(c.topics))
-	for k, v := range c.topics {
+	out := make(map[string]WorkloadConfig, len(c.workloads))
+	for k, v := range c.workloads {
 		out[k] = v
 	}
 	return out
 }
 
 func (c *Controller) refreshConfigs(ctx context.Context) error {
-	if len(c.cfg.StaticTopics) > 0 {
+	if len(c.cfg.StaticWorkloads) > 0 {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		c.topics = make(map[string]TopicConfig, len(c.cfg.StaticTopics))
-		for _, t := range c.cfg.StaticTopics {
-			c.topics[t.Name] = t
+		c.workloads = make(map[string]WorkloadConfig, len(c.cfg.StaticWorkloads))
+		for _, t := range c.cfg.StaticWorkloads {
+			c.workloads[t.Name] = t
 		}
 		return nil
 	}
-	names, err := c.client.SMembers(ctx, c.cfg.TopicIndexKey).Result()
+	names, err := c.client.SMembers(ctx, c.cfg.WorkloadIndexKey).Result()
 	if err != nil {
 		return err
 	}
-	configs := map[string]TopicConfig{}
+	configs := map[string]WorkloadConfig{}
 	for _, name := range names {
-		tc, err := c.fetchTopicConfig(ctx, name)
+		tc, err := c.fetchWorkloadConfig(ctx, name)
 		if err != nil {
-			c.logger.Warn("fetch topic config failed", Field{Key: "topic", Value: name}, Field{Key: "err", Value: err})
+			c.logger.Warn("fetch workload config failed", Field{Key: "workload", Value: name}, Field{Key: "err", Value: err})
 			continue
 		}
 		if tc.Name == "" {
 			tc.Name = name
 		}
-		if tc.Partitions > 0 {
+		if tc.Units > 0 {
 			configs[tc.Name] = tc
 		}
 	}
 	c.mu.Lock()
-	c.topics = configs
+	c.workloads = configs
 	c.mu.Unlock()
 	return nil
 }
 
-func (c *Controller) refreshTopic(ctx context.Context, topic string) error {
-	if len(c.cfg.StaticTopics) > 0 {
+func (c *Controller) refreshWorkload(ctx context.Context, workload string) error {
+	if len(c.cfg.StaticWorkloads) > 0 {
 		return nil
 	}
-	tc, err := c.fetchTopicConfig(ctx, topic)
+	tc, err := c.fetchWorkloadConfig(ctx, workload)
 	if err != nil {
 		return err
 	}
-	if tc.Partitions == 0 {
-		return fmt.Errorf("topic %s partitions zero", topic)
+	if tc.Units == 0 {
+		return fmt.Errorf("workload %s units zero", workload)
 	}
 	c.mu.Lock()
-	c.topics[tc.Name] = tc
+	c.workloads[tc.Name] = tc
 	c.mu.Unlock()
 	return nil
 }
 
-func (c *Controller) fetchTopicConfig(ctx context.Context, topic string) (TopicConfig, error) {
-	raw, err := c.client.Get(ctx, c.cfg.ConfigKeyPrefix+topic).Result()
+func (c *Controller) fetchWorkloadConfig(ctx context.Context, workload string) (WorkloadConfig, error) {
+	raw, err := c.client.Get(ctx, c.cfg.WorkloadConfigKeyPrefix+workload).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return TopicConfig{}, fmt.Errorf("topic %s missing config", topic)
+			return WorkloadConfig{}, fmt.Errorf("workload %s missing config", workload)
 		}
-		return TopicConfig{}, err
+		return WorkloadConfig{}, err
 	}
-	var cfg TopicConfig
+	var cfg WorkloadConfig
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
-		return TopicConfig{}, err
+		return WorkloadConfig{}, err
 	}
 	if cfg.Name == "" {
-		cfg.Name = topic
+		cfg.Name = workload
 	}
 	return cfg, nil
 }
@@ -635,7 +668,12 @@ func (c *Controller) liveNodes(ctx context.Context) (map[string]bool, error) {
 
 func (c *Controller) weightsSnapshot(live map[string]bool) []NodeWeight {
 	out := make([]NodeWeight, 0, len(live))
+	ids := make([]string, 0, len(live))
 	for id := range live {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
 		weight := c.cfg.DefaultWeight
 		if w, ok := c.cfg.StaticWeights[id]; ok {
 			weight = w
@@ -723,11 +761,11 @@ func nodeKey(nodeID string) string {
 }
 
 func leaseKey(slot Slot) string {
-	return fmt.Sprintf("lease:%s:%d", slot.Topic, slot.Index)
+	return fmt.Sprintf("lease:%s:%d", slot.Workload, slot.Unit)
 }
 
 func movedKey(slot Slot) string {
-	return fmt.Sprintf("moved:%s:%d", slot.Topic, slot.Index)
+	return fmt.Sprintf("moved:%s:%d", slot.Workload, slot.Unit)
 }
 
 func jitter(base time.Duration, ratio float64) time.Duration {

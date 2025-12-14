@@ -2,6 +2,7 @@ package rendez
 
 import (
 	"math"
+	"sort"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -12,31 +13,44 @@ type NodeWeight struct {
 	Weight float64
 }
 
+// NodeScore represents a ranked HRW score for a node.
+type NodeScore struct {
+	ID     string
+	Score  float64
+	Weight float64
+}
+
 // RendezvousOwner returns the node ID with the highest weighted HRW score.
 func RendezvousOwner(slot Slot, nodes []NodeWeight) (string, bool) {
-	if len(nodes) == 0 {
+	ranking := RendezvousRanking(slot, nodes)
+	if len(ranking) == 0 {
 		return "", false
 	}
-	var (
-		bestID    string
-		bestScore float64
-	)
+	return ranking[0].ID, true
+}
+
+// RendezvousRanking returns all candidates sorted by weighted HRW score (descending).
+func RendezvousRanking(slot Slot, nodes []NodeWeight) []NodeScore {
+	if len(nodes) == 0 {
+		return nil
+	}
 	key := slot.Key()
+	out := make([]NodeScore, 0, len(nodes))
 	for _, n := range nodes {
 		weight := n.Weight
 		if weight <= 0 {
 			continue
 		}
 		score := weightedScore(key, n.ID, weight)
-		if bestID == "" || score > bestScore || (score == bestScore && n.ID < bestID) {
-			bestID = n.ID
-			bestScore = score
+		out = append(out, NodeScore{ID: n.ID, Score: score, Weight: weight})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Score == out[j].Score {
+			return out[i].ID < out[j].ID
 		}
-	}
-	if bestID == "" {
-		return "", false
-	}
-	return bestID, true
+		return out[i].Score > out[j].Score
+	})
+	return out
 }
 
 func weightedScore(key, nodeID string, weight float64) float64 {

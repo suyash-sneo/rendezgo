@@ -7,7 +7,7 @@ import (
 
 func TestRendezvousDeterministic(t *testing.T) {
 	nodes := []NodeWeight{{ID: "a", Weight: 1}, {ID: "b", Weight: 1}}
-	slot := Slot{Topic: "alpha", Index: 3}
+	slot := Slot{Workload: "alpha", Unit: 3}
 	first, ok := RendezvousOwner(slot, nodes)
 	if !ok {
 		t.Fatalf("expected owner")
@@ -25,7 +25,7 @@ func TestWeightedBias(t *testing.T) {
 	heavy := 0
 	total := 200
 	for i := 0; i < total; i++ {
-		slot := Slot{Topic: "topic", Index: i}
+		slot := Slot{Workload: "workload", Unit: i}
 		owner, ok := RendezvousOwner(slot, nodes)
 		if !ok {
 			t.Fatalf("missing owner at %d", i)
@@ -43,7 +43,7 @@ func TestMinimalChurnOnRemoval(t *testing.T) {
 	nodes := []NodeWeight{{ID: "n1", Weight: 1}, {ID: "n2", Weight: 1}, {ID: "n3", Weight: 1}}
 	keys := make([]Slot, 0, 200)
 	for i := 0; i < 200; i++ {
-		keys = append(keys, Slot{Topic: fmt.Sprintf("t-%d", i), Index: i % 3})
+		keys = append(keys, Slot{Workload: fmt.Sprintf("t-%d", i), Unit: i % 3})
 	}
 	before := map[string]string{}
 	for _, s := range keys {
