@@ -33,7 +33,9 @@
 - `pkg/rendezgo`: public API (`Config`, `Controller`, `OwnedSlots`, interfaces for Redis client, consumer factory, logger, metrics, weight/health hooks).
 - `internal/redis_scripts`: Lua for renew/release with sha helpers.
 - `cmd/rendez-agent`: example binary that wires a controller to Redis with a simple consumer factory.
-- `playground/cmd`: interactive chaos playground (simulated Redis by default, real mode available) with scenarios, live dashboard, and HRW explanations. `playground/docker-compose.yml` provides a convenience Redis for `-mode=real`.
+- `playground/sim`: reusable simulation core (engine, snapshots, events).
+- `playground/ui/tui`: Bubble Tea TUI consuming `playground/sim` snapshots/events.
+- `playground/cmd`: playground entrypoint wiring flags -> sim.Engine -> TUI. `playground/docker-compose.yml` provides a convenience Redis for `-mode=real`.
 
 ## Failure semantics
 

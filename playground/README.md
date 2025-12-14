@@ -1,8 +1,8 @@
 # Playground
 
-An interactive chaos lab that runs real rendezgo controllers against Redis. It defaults to an in-process Redis simulator but can target a real Redis easily.
+Interactive chaos lab for rendezgo controllers with a Bubble Tea TUI. Runs in simulated mode (in-process Redis) by default or against a real Redis.
 
-## Run (simulated Redis)
+## Run (simulated)
 
 From repo root:
 
@@ -19,22 +19,40 @@ go run ./cmd
 
 ## Run against real Redis
 
-Spin up the included Redis:
+Use the bundled compose file for a local Redis:
 
 ```
 docker compose -f playground/docker-compose.yml up -d
 ```
 
-Then point the playground at it:
+Then start the playground pointing at it:
 
 ```
 go run ./playground/cmd -mode=real -redis=127.0.0.1:6379
 ```
 
-## Useful flags
+## Flags
 
-- `-workloads` (`name:units,name2:units2`) to set workloads/units (default `demo:8`).
-- `-dashboard-interval` to control dashboard refresh (default 1s).
-- `-mode` `simulated|real` and `-redis` address for real mode.
+- `-workloads` (e.g., `demo:8,other:4`)
+- `-nodes` initial node count
+- `-mode` `simulated|real`
+- `-redis` address for real mode
+- `-topk` HRW candidate display depth
+- `-scenario` built-in scenario name
+- `-scenario-file` path to YAML/JSON timed commands
 
-Inside the REPL, type `help` for commands (add/remove nodes, adjust weights, health/fault toggles, focus/predict/explain, scenarios, etc.).
+## TUI keys
+
+- `:` enter command input
+- `Enter` run command
+- `Esc` cancel input
+- `?` toggle help
+- Arrow/Page keys scroll log; tail follows when at bottom
+- Up/Down navigate command history while in command mode
+- `q` / `Ctrl+C` quit
+
+## Commands
+
+`add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `focus <workload|none>`, `predict down <node>`, `explain <workload> <unit>`, `scenario <name>`, `load <file>`.
+
+Scenario files are simple YAML/JSON lists of timed commands.

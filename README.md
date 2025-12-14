@@ -115,11 +115,11 @@ go run ./playground/cmd -mode=real -redis=host:6379
 # cd playground && go run ./cmd
 ```
 
-Dashboard shows node weights/state, owned vs desired counts, per-workload breakdowns, churn/min, caps, per-unit ownership/TTL/cooldown, and HRW candidate queues. Commands: `add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `focus <workload|none>`, `dashboard on|off`, `predict down <node>`, `explain <workload> <unit>`, `scenario <name>`, `load <file>`. Use `-workloads` (`name:units,...`) and `-dashboard-interval` flags to tune simulations. Scenario files are simple YAML/JSON lists of timed commands.
+TUI shows a persistent log pane (no flickering), header with caps + convergence, nodes table, unit ownership view, and HRW candidates. Keys: `:` to enter command input, `?` help, `q`/Ctrl+C quit, arrow/Page keys to scroll the log, and Up/Down to navigate command history while editing. Commands: `add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `focus <workload|none>`, `predict down <node>`, `explain <workload> <unit>`, `scenario <name>`, `load <file>`. Flags: `-workloads` (`name:units,...`), `-nodes` (initial nodes), `-topk`, `-mode`, `-redis`, `-scenario`, `-scenario-file`. Scenario files are simple YAML/JSON lists of timed commands.
 
 ## Architecture
 
-See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendezgo` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `playground/cmd`).
+See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendezgo` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `playground/sim`, `playground/ui/tui`, `playground/cmd`).
 
 ## Testing
 
