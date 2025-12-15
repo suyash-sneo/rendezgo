@@ -3,6 +3,7 @@ package sim
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -22,62 +23,56 @@ import (
 	"github.com/suyash-sneo/rendezgo/pkg/rendezgo"
 )
 
-type Mode string
-
-const (
-	ModeSimulated Mode = "simulated"
-	ModeReal      Mode = "real"
-)
-
-type Options struct {
-	Mode         Mode
-	RedisAddr    string
-	Workloads    []rendezgo.WorkloadConfig
-	InitialNodes int
-	TopK         int
-	Scenario     string
-	ScenarioFile string
+// EngineOptions configures a simulation engine.
+type EngineOptions struct {
+	Mode             string
+	RedisAddr        string
+	InitialNodes     int
+	Workloads        []rendezgo.WorkloadConfig
+	TopK             int
+	SnapshotInterval time.Duration
+	ScenarioName     string
+	ScenarioFilePath string
 }
 
+// Engine drives a cluster of rendezgo controllers and exposes snapshots/events.
 type Engine struct {
-	mu           sync.Mutex
-	mode         Mode
-	redisAddr    string
-	server       *miniredis.Miniredis
-	admin        *redis.Client
-	template     rendezgo.Config
-	weights      *weightTable
-	nodes        map[string]*simNode
-	events       *RingBuffer
-	owners       map[string]string
-	churn        []time.Time
-	focus        string
-	topK         int
-	ctx          context.Context
-	cancel       context.CancelFunc
-	scenario     string
-	scenarioFile string
-	initNodes    int
+	mu             sync.Mutex
+	opts           EngineOptions
+	template       rendezgo.Config
+	weights        *weightTable
+	nodes          map[string]*simNode
+	events         *RingBuffer
+	owners         map[string]string
+	churn          []time.Time
+	focus          string
+	server         *miniredis.Miniredis
+	timeDriverStop chan struct{}
+	admin          *redis.Client
+	ctx            context.Context
+	cancel         context.CancelFunc
+	lastSnapshot   Snapshot
+	lastSnapshotAt time.Time
+	redisAddr      string
 }
 
 type simNode struct {
-	id      string
-	weight  float64
-	cancel  context.CancelFunc
-	ctrl    *rendezgo.Controller
-	client  *redis.Client
-	hook    *chaosHook
-	health  *healthGate
-	healthy bool
+	id        string
+	weight    float64
+	cancel    context.CancelFunc
+	done      chan struct{}
+	ctrl      *rendezgo.Controller
+	client    *redis.Client
+	hook      *chaosHook
+	health    *healthGate
+	healthy   bool
+	redisFail bool
 }
 
-type CommandResult struct {
-	Message string
-}
-
-func NewEngine(opts Options) (*Engine, error) {
+// NewEngine builds an engine with sensible defaults for simulation.
+func NewEngine(opts EngineOptions) (*Engine, error) {
 	if opts.Mode == "" {
-		opts.Mode = ModeSimulated
+		opts.Mode = "simulated"
 	}
 	if opts.RedisAddr == "" {
 		opts.RedisAddr = "127.0.0.1:6379"
@@ -85,6 +80,10 @@ func NewEngine(opts Options) (*Engine, error) {
 	if opts.TopK <= 0 {
 		opts.TopK = 3
 	}
+	if opts.SnapshotInterval <= 0 {
+		opts.SnapshotInterval = time.Second
+	}
+
 	cfg := rendezgo.DefaultConfig()
 	cfg.ClusterID = "sim"
 	cfg.ReconcileInterval = 2 * time.Second
@@ -99,30 +98,30 @@ func NewEngine(opts Options) (*Engine, error) {
 	cfg.AcquireLimit = 200
 	cfg.StaticWorkloads = opts.Workloads
 
-	eng := &Engine{
-		mode:         opts.Mode,
-		redisAddr:    opts.RedisAddr,
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	return &Engine{
+		opts:         opts,
 		template:     cfg,
 		weights:      newWeightTable(),
 		nodes:        map[string]*simNode{},
 		events:       NewRingBuffer(2000),
 		owners:       map[string]string{},
-		focus:        "",
-		topK:         opts.TopK,
-		scenario:     opts.Scenario,
-		scenarioFile: opts.ScenarioFile,
-		initNodes:    opts.InitialNodes,
-	}
-	return eng, nil
+		redisAddr:    opts.RedisAddr,
+		lastSnapshot: Snapshot{},
+	}, nil
 }
 
+// Start prepares Redis and spins up initial nodes.
 func (e *Engine) Start(ctx context.Context) error {
 	e.mu.Lock()
 	if e.ctx != nil {
 		e.mu.Unlock()
 		return nil
 	}
-	if e.mode == ModeSimulated {
+	if e.opts.Mode == "simulated" {
 		server, err := miniredis.Run()
 		if err != nil {
 			e.mu.Unlock()
@@ -130,44 +129,82 @@ func (e *Engine) Start(ctx context.Context) error {
 		}
 		e.server = server
 		e.redisAddr = server.Addr()
+		e.timeDriverStop = make(chan struct{})
 	}
 	e.admin = redis.NewClient(&redis.Options{Addr: e.redisAddr})
 	e.ctx, e.cancel = context.WithCancel(ctx)
-	initNodes := e.initNodes
-	if initNodes <= 0 {
-		initNodes = 3
+	initialNodes := e.opts.InitialNodes
+	if initialNodes <= 0 {
+		initialNodes = 3
 	}
+	scenario := e.opts.ScenarioName
+	scriptPath := e.opts.ScenarioFilePath
 	e.mu.Unlock()
 
-	for i := 0; i < initNodes; i++ {
-		e.addNode(1.0, "")
+	e.recordEvent(EventEngineStart, fmt.Sprintf("engine start mode=%s redis=%s", e.opts.Mode, e.redisAddr), map[string]interface{}{
+		"mode":  e.opts.Mode,
+		"redis": e.redisAddr,
+	})
+
+	if e.opts.Mode == "simulated" && e.server != nil {
+		go e.driveSimulatedTime(e.ctx, e.server, e.timeDriverStop)
 	}
 
-	if e.scenario != "" {
-		go e.runScenario(e.ctx, e.scenario)
+	for i := 0; i < initialNodes; i++ {
+		if _, err := e.addNode(1.0, ""); err != nil {
+			return err
+		}
 	}
-	if e.scenarioFile != "" {
-		go e.runScenarioFile(e.ctx, e.scenarioFile)
+
+	if scenario != "" {
+		go e.RunScenario(scenario)
+	}
+	if scriptPath != "" {
+		data, err := os.ReadFile(filepath.Clean(scriptPath))
+		if err != nil {
+			e.recordError(fmt.Sprintf("scenario file %s: %v", scriptPath, err), map[string]interface{}{"file": scriptPath})
+		} else {
+			go e.RunScenarioFile(scriptPath, data)
+		}
 	}
 	return nil
 }
 
-func (e *Engine) Stop() {
+// Close stops all controllers and Redis resources. Idempotent.
+func (e *Engine) Close() error {
 	e.mu.Lock()
 	cancel := e.cancel
-	e.cancel = nil
+	ctx := e.ctx
 	nodes := e.nodes
 	e.nodes = map[string]*simNode{}
+	e.cancel = nil
+	e.ctx = nil
 	server := e.server
+	e.server = nil
+	stopTime := e.timeDriverStop
+	e.timeDriverStop = nil
 	admin := e.admin
+	e.admin = nil
 	e.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
+	if ctx != nil {
+		<-ctx.Done()
+	}
+	if stopTime != nil {
+		close(stopTime)
+	}
 	for _, n := range nodes {
 		n.ctrl.SetReleaseOnShutdown(true)
 		n.cancel()
+		if n.done != nil {
+			select {
+			case <-n.done:
+			case <-time.After(2 * time.Second):
+			}
+		}
 		_ = n.client.Close()
 	}
 	if server != nil {
@@ -176,174 +213,392 @@ func (e *Engine) Stop() {
 	if admin != nil {
 		_ = admin.Close()
 	}
+	e.recordEvent(EventEngineStop, "engine stopped", nil)
+	return nil
 }
 
-func (e *Engine) emit(t EventType, msg string, fields map[string]interface{}) {
-	e.events.Append(Event{At: time.Now(), Type: t, Message: msg, Fields: fields})
+// Snapshot returns the most recent snapshot; expensive rebuilds are throttled by SnapshotInterval.
+func (e *Engine) Snapshot() Snapshot {
+	now := time.Now()
+	e.mu.Lock()
+	last := e.lastSnapshot
+	lastAt := e.lastSnapshotAt
+	interval := e.opts.SnapshotInterval
+	e.mu.Unlock()
+
+	if !lastAt.IsZero() && interval > 0 && now.Sub(lastAt) < interval {
+		return interpolateSnapshot(last, now.Sub(lastAt))
+	}
+
+	snap := e.buildSnapshot(now)
+	e.mu.Lock()
+	e.lastSnapshot = snap
+	e.lastSnapshotAt = now
+	e.mu.Unlock()
+	return snap
 }
 
-func (e *Engine) ExecCommand(ctx context.Context, line string) (CommandResult, error) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return CommandResult{}, nil
+// EventsSince returns all events after the provided seq and the latest delivered seq.
+func (e *Engine) EventsSince(seq uint64) ([]Event, uint64) {
+	return e.events.Since(seq)
+}
+
+// AddNodes adds N new nodes with the supplied weight.
+func (e *Engine) AddNodes(count int, weight float64) error {
+	if count <= 0 {
+		count = 1
 	}
-	e.emit(EventCommand, line, map[string]interface{}{"command": line})
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return CommandResult{}, nil
+	for i := 0; i < count; i++ {
+		if _, err := e.addNode(weight, ""); err != nil {
+			return err
+		}
 	}
-	cmd := strings.ToLower(fields[0])
-	args := fields[1:]
-	switch cmd {
-	case "help":
-		msg := "commands: add [n] [weight], remove <id>, restart <id>, kill <id>, weight <id> <w>, fail <id> on|off, health <id> on|off, shedding on|off, release <n>, scenario <name>, load <file>, focus <workload|none>, predict down <node>, explain <workload> <unit>"
-		e.emit(EventInfo, msg, nil)
-		return CommandResult{Message: msg}, nil
-	case "add":
-		count := 1
-		weight := 1.0
-		if len(args) > 0 {
-			if v, err := strconv.Atoi(args[0]); err == nil {
-				count = v
+	return nil
+}
+
+// RemoveNode removes a node, optionally releasing leases.
+func (e *Engine) RemoveNode(id string, graceful bool) error {
+	return e.removeNode(id, graceful, EventNodeRemove)
+}
+
+// RestartNode restarts a node preserving its weight.
+func (e *Engine) RestartNode(id string) error {
+	e.mu.Lock()
+	node, ok := e.nodes[id]
+	weight := 1.0
+	if ok {
+		weight = node.weight
+	}
+	e.mu.Unlock()
+	if !ok {
+		return e.recordError(fmt.Sprintf("node %s not found", id), map[string]interface{}{"nodeID": id})
+	}
+	base := id
+	if strings.Contains(id, ":") {
+		parts := strings.Split(id, ":")
+		base = parts[len(parts)-1]
+	}
+	if err := e.removeNode(id, true, EventNodeRestart); err != nil {
+		return err
+	}
+	newID, err := e.addNode(weight, base)
+	if err != nil {
+		return err
+	}
+	e.recordEvent(EventNodeRestart, fmt.Sprintf("restarted %s -> %s", id, newID), map[string]interface{}{"from": id, "to": newID})
+	return nil
+}
+
+// KillNode forcefully removes a node without graceful release.
+func (e *Engine) KillNode(id string) error {
+	return e.removeNode(id, false, EventNodeKill)
+}
+
+// SetWeight adjusts a node weight.
+func (e *Engine) SetWeight(id string, weight float64) error {
+	e.mu.Lock()
+	node, ok := e.nodes[id]
+	if ok {
+		node.weight = weight
+	}
+	e.mu.Unlock()
+	if !ok {
+		return e.recordError(fmt.Sprintf("node %s not found", id), map[string]interface{}{"nodeID": id})
+	}
+	e.weights.Set(id, weight)
+	e.recordEvent(EventNodeWeight, fmt.Sprintf("weight %s=%.2f", id, weight), map[string]interface{}{"nodeID": id, "weight": weight})
+	return nil
+}
+
+// SetRedisFault toggles forced Redis errors for a node.
+func (e *Engine) SetRedisFault(id string, fail bool) error {
+	e.mu.Lock()
+	node, ok := e.nodes[id]
+	e.mu.Unlock()
+	if !ok {
+		return e.recordError(fmt.Sprintf("node %s not found", id), map[string]interface{}{"nodeID": id})
+	}
+	node.hook.fail.Store(fail)
+	node.redisFail = fail
+	e.recordEvent(EventNodeRedisFail, fmt.Sprintf("redis fault %s=%v", id, fail), map[string]interface{}{"nodeID": id, "fail": fail})
+	return nil
+}
+
+// SetHealth toggles node health gate.
+func (e *Engine) SetHealth(id string, healthy bool) error {
+	e.mu.Lock()
+	node, ok := e.nodes[id]
+	e.mu.Unlock()
+	if !ok {
+		return e.recordError(fmt.Sprintf("node %s not found", id), map[string]interface{}{"nodeID": id})
+	}
+	node.health.Set(healthy)
+	node.healthy = healthy
+	e.recordEvent(EventNodeHealth, fmt.Sprintf("health %s=%v", id, healthy), map[string]interface{}{"nodeID": id, "healthy": healthy})
+	return nil
+}
+
+// SetShedding toggles shedding feature and restarts controllers to pick up config.
+func (e *Engine) SetShedding(enabled bool) error {
+	e.mu.Lock()
+	e.template.SheddingEnabled = enabled
+	e.mu.Unlock()
+	e.restartAll()
+	e.recordEvent(EventShedding, fmt.Sprintf("shedding enabled=%v", enabled), map[string]interface{}{"enabled": enabled})
+	return nil
+}
+
+// SetSheddingRelease adjusts the release rate and restarts controllers.
+func (e *Engine) SetSheddingRelease(perInterval int) error {
+	e.mu.Lock()
+	e.template.SheddingRelease = perInterval
+	e.mu.Unlock()
+	e.restartAll()
+	e.recordEvent(EventSheddingRate, fmt.Sprintf("shedding release=%d", perInterval), map[string]interface{}{"perInterval": perInterval})
+	return nil
+}
+
+// SetFocus records the workload focus; snapshot includes the hint.
+func (e *Engine) SetFocus(workload string) error {
+	e.mu.Lock()
+	e.focus = workload
+	e.mu.Unlock()
+	e.recordEvent(EventFocus, fmt.Sprintf("focus set to %s", workload), map[string]interface{}{"workload": workload})
+	return nil
+}
+
+// PredictDown forecasts slot movements if nodeID disappears.
+func (e *Engine) PredictDown(nodeID string) (PredictDownResult, error) {
+	if nodeID == "" {
+		return PredictDownResult{}, e.recordError("nodeID required", map[string]interface{}{"endpoint": "predict.down"})
+	}
+	if e.ctx == nil {
+		return PredictDownResult{}, e.recordError("engine not started", map[string]interface{}{"endpoint": "predict.down"})
+	}
+	e.mu.Lock()
+	workloads := append([]rendezgo.WorkloadConfig{}, e.template.StaticWorkloads...)
+	topK := e.opts.TopK
+	e.mu.Unlock()
+
+	full := e.liveWeights("")
+	remaining := e.liveWeights(nodeID)
+	removed := len(full) != len(remaining)
+	nowMs := time.Now().UnixMilli()
+	currentDesired := rendezgo.DesiredOwners(workloads, full)
+	predicted := rendezgo.DesiredOwners(workloads, remaining)
+
+	moves := []PredictedMove{}
+	summary := map[string]int{}
+	for _, wl := range workloads {
+		for unit := 0; unit < wl.Units; unit++ {
+			slot := rendezgo.Slot{Workload: wl.Name, Unit: unit}
+			key := e.leaseKey(slot)
+			cur := currentDesired[key]
+			next := predicted[key]
+			if cur == next {
+				continue
 			}
-		}
-		if len(args) > 1 {
-			if v, err := strconv.ParseFloat(args[1], 64); err == nil {
-				weight = v
+			reason := "unknown"
+			if cur == "" {
+				reason = "wasUnowned"
+			} else {
+				reason = "desiredOwnerChanged"
 			}
+			var ranking []rendezgo.NodeScore
+			if topK > 0 {
+				ranking = rendezgo.RendezvousTopK(slot, remaining, topK)
+			} else {
+				ranking = rendezgo.RendezvousRanking(slot, remaining)
+			}
+			candidates := make([]HRWCandidate, 0, len(ranking))
+			for _, r := range ranking {
+				candidates = append(candidates, HRWCandidate{
+					NodeID:  r.ID,
+					ShortID: shortID(r.ID),
+					Weight:  r.Weight,
+					Score:   r.Score,
+				})
+			}
+			if next != "" {
+				summary[next]++
+			}
+			moves = append(moves, PredictedMove{
+				Workload:   slot.Workload,
+				Unit:       slot.Unit,
+				FromOwner:  cur,
+				ToOwner:    next,
+				Reason:     reason,
+				Candidates: candidates,
+			})
 		}
-		for i := 0; i < count; i++ {
-			e.addNode(weight, "")
-		}
-		return CommandResult{Message: "added"}, nil
-	case "remove":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: remove <id>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.removeNode(args[0], true)
-		return CommandResult{Message: "removed"}, nil
-	case "restart":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: restart <id>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.restartNode(args[0])
-		return CommandResult{Message: "restarted"}, nil
-	case "kill":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: kill <id>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.removeNode(args[0], false)
-		return CommandResult{Message: "killed"}, nil
-	case "weight":
-		if len(args) < 2 {
-			err := fmt.Errorf("usage: weight <id> <weight>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		w, err := strconv.ParseFloat(args[1], 64)
-		if err != nil {
-			err = fmt.Errorf("invalid weight")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.adjustWeight(args[0], w)
-		return CommandResult{Message: "weight set"}, nil
-	case "fail":
-		if len(args) < 2 {
-			err := fmt.Errorf("usage: fail <id> on|off")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.setRedisFault(args[0], args[1] == "on")
-		return CommandResult{Message: "fail set"}, nil
-	case "health":
-		if len(args) < 2 {
-			err := fmt.Errorf("usage: health <id> on|off")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.setHealth(args[0], args[1] == "on")
-		return CommandResult{Message: "health set"}, nil
-	case "shedding":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: shedding on|off")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.setShedding(args[0] == "on")
-		return CommandResult{Message: "shedding"}, nil
-	case "release":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: release <per-interval>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		if v, err := strconv.Atoi(args[0]); err == nil {
-			e.setRelease(v)
-		}
-		return CommandResult{Message: "release"}, nil
-	case "scenario":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: scenario <name>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		go e.runScenario(ctx, args[0])
-		return CommandResult{Message: "scenario"}, nil
-	case "load":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: load <file>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		go e.runScenarioFile(ctx, args[0])
-		return CommandResult{Message: "load"}, nil
-	case "focus":
-		if len(args) < 1 {
-			err := fmt.Errorf("usage: focus <workload|none>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.setFocus(args[0])
-		return CommandResult{Message: "focus"}, nil
-	case "predict":
-		if len(args) == 2 && args[0] == "down" {
-			e.predictDown(args[1])
-			return CommandResult{Message: "predict"}, nil
-		}
-		err := fmt.Errorf("usage: predict down <nodeID>")
-		e.emit(EventError, err.Error(), nil)
-		return CommandResult{}, err
-	case "explain":
-		if len(args) < 2 {
-			err := fmt.Errorf("usage: explain <workload> <unit>")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		unit, err := strconv.Atoi(args[1])
-		if err != nil {
-			err = fmt.Errorf("unit must be integer")
-			e.emit(EventError, err.Error(), nil)
-			return CommandResult{}, err
-		}
-		e.explain(args[0], unit)
-		return CommandResult{Message: "explain"}, nil
-	default:
-		err := fmt.Errorf("unknown command")
-		e.emit(EventError, err.Error(), nil)
-		return CommandResult{}, err
 	}
+
+	sort.Slice(moves, func(i, j int) bool {
+		if moves[i].Workload == moves[j].Workload {
+			return moves[i].Unit < moves[j].Unit
+		}
+		return moves[i].Workload < moves[j].Workload
+	})
+
+	summaryList := make([]PredictDownSummaryOwner, 0, len(summary))
+	for node, count := range summary {
+		summaryList = append(summaryList, PredictDownSummaryOwner{NodeID: node, Count: count})
+	}
+	sort.Slice(summaryList, func(i, j int) bool { return summaryList[i].NodeID < summaryList[j].NodeID })
+
+	result := PredictDownResult{
+		NodeID:             nodeID,
+		RemovedFromLiveSet: removed,
+		GeneratedAtUnixMs:  nowMs,
+		Moves:              moves,
+		Summary: PredictDownSummary{
+			UnitsImpacted: len(moves),
+			ByToOwner:     summaryList,
+		},
+	}
+	e.recordEvent(EventPredictDown, fmt.Sprintf("predict down %s moves=%d", nodeID, len(moves)), map[string]interface{}{"nodeID": nodeID, "moves": len(moves)})
+	return result, nil
 }
 
-func (e *Engine) addNode(weight float64, customID string) string {
+// ExplainUnit returns an HRW breakdown for a unit.
+func (e *Engine) ExplainUnit(workload string, unit int) (ExplainUnitResult, error) {
+	if workload == "" || unit < 0 {
+		return ExplainUnitResult{}, e.recordError("workload and unit required", map[string]interface{}{"endpoint": "explain.unit"})
+	}
+	if e.admin == nil {
+		return ExplainUnitResult{}, e.recordError("engine not started", map[string]interface{}{"endpoint": "explain.unit"})
+	}
+	e.mu.Lock()
+	workloads := append([]rendezgo.WorkloadConfig{}, e.template.StaticWorkloads...)
+	e.mu.Unlock()
+
+	var match *rendezgo.WorkloadConfig
+	for i := range workloads {
+		if workloads[i].Name == workload {
+			match = &workloads[i]
+			break
+		}
+	}
+	if match == nil || unit >= match.Units {
+		return ExplainUnitResult{}, e.recordError("unknown workload/unit", map[string]interface{}{"endpoint": "explain.unit", "workload": workload, "unit": unit})
+	}
+
+	slot := rendezgo.Slot{Workload: workload, Unit: unit}
+	now := time.Now()
+	weights := e.liveWeights("")
+	ranking := rendezgo.RendezvousRanking(slot, weights)
+	ctx := context.Background()
+	key := e.leaseKey(slot)
+	owner, _ := e.admin.Get(ctx, key).Result()
+	ttl, _ := e.admin.PTTL(ctx, key).Result()
+	coolKey := e.cooldownKey(slot)
+	coolTTL, _ := e.admin.PTTL(ctx, coolKey).Result()
+
+	liveNodes := make([]ExplainLiveNode, 0, len(weights))
+	for _, w := range weights {
+		liveNodes = append(liveNodes, ExplainLiveNode{NodeID: w.ID, ShortID: shortID(w.ID), Weight: w.Weight})
+	}
+	sort.Slice(liveNodes, func(i, j int) bool { return liveNodes[i].NodeID < liveNodes[j].NodeID })
+
+	explainRanking := make([]ExplainRanking, 0, len(ranking))
+	for i := 0; i < len(ranking); i++ {
+		explainRanking = append(explainRanking, ExplainRanking{
+			NodeID:  ranking[i].ID,
+			ShortID: shortID(ranking[i].ID),
+			Weight:  ranking[i].Weight,
+			Score:   ranking[i].Score,
+			Rank:    i + 1,
+		})
+	}
+
+	res := ExplainUnitResult{
+		Workload:          workload,
+		Unit:              unit,
+		SlotKey:           slot.Key(),
+		GeneratedAtUnixMs: now.UnixMilli(),
+		LiveNodes:         liveNodes,
+		Ranking:           explainRanking,
+		CurrentLease: ExplainLease{
+			Key:   key,
+			Owner: owner,
+			TTLMs: maxTTL(ttl),
+		},
+		Cooldown: ExplainCooldown{
+			Key:    coolKey,
+			Active: coolTTL > 0,
+			TTLMs:  maxTTL(coolTTL),
+		},
+	}
+	e.recordEvent(EventExplainUnit, fmt.Sprintf("explain %s[%d]", workload, unit), map[string]interface{}{"workload": workload, "unit": unit})
+	return res, nil
+}
+
+// RunScenario triggers a built-in scenario asynchronously.
+func (e *Engine) RunScenario(name string) error {
+	if name == "" {
+		return e.recordError("scenario name required", map[string]interface{}{"endpoint": "scenario.run"})
+	}
+	go e.runScenario(e.ctx, name)
+	return nil
+}
+
+// RunScenarioFile schedules events from a YAML/JSON scenario description.
+func (e *Engine) RunScenarioFile(filename string, data []byte) error {
+	if len(data) == 0 {
+		return e.recordError("scenario file empty", map[string]interface{}{"endpoint": "scenario.upload"})
+	}
+	var file scenarioFile
+	if strings.HasSuffix(strings.ToLower(filename), ".json") {
+		if err := json.Unmarshal(data, &file.Events); err != nil {
+			return e.recordError(fmt.Sprintf("parse scenario json: %v", err), map[string]interface{}{"endpoint": "scenario.upload", "file": filename})
+		}
+	} else {
+		if err := yaml.Unmarshal(data, &file.Events); err != nil {
+			return e.recordError(fmt.Sprintf("parse scenario yaml: %v", err), map[string]interface{}{"endpoint": "scenario.upload", "file": filename})
+		}
+	}
+	start := time.Now()
+	e.recordEvent(EventScenarioStart, fmt.Sprintf("scenario file %s start", filepath.Base(filename)), map[string]interface{}{"file": filename})
+	for _, evt := range file.Events {
+		delay, err := time.ParseDuration(evt.At)
+		if err != nil {
+			e.recordEvent(EventScenarioError, fmt.Sprintf("bad scenario delay %s", evt.At), map[string]interface{}{"file": filename})
+			continue
+		}
+		wait := delay - time.Since(start)
+		if wait < 0 {
+			wait = 0
+		}
+		go func(ev scenarioEvent) {
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-time.After(wait):
+				e.recordEvent(EventScenarioStep, ev.Command, map[string]interface{}{"file": filename})
+				if err := e.execScenarioCommand(context.Background(), ev.Command); err != nil {
+					e.recordEvent(EventScenarioError, err.Error(), map[string]interface{}{"file": filename})
+				}
+			}
+		}(evt)
+	}
+	go func() {
+		select {
+		case <-e.ctx.Done():
+		case <-time.After(time.Since(start) + 2*time.Second):
+			e.recordEvent(EventScenarioDone, fmt.Sprintf("scenario file %s done", filepath.Base(filename)), map[string]interface{}{"file": filename})
+		}
+	}()
+	return nil
+}
+
+// internal helpers
+
+func (e *Engine) addNode(weight float64, customID string) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.ctx == nil {
+		return "", errors.New("engine not started")
+	}
 	id := customID
 	if id == "" {
 		id = fmt.Sprintf("n-%d", len(e.nodes)+1)
@@ -357,20 +612,23 @@ func (e *Engine) addNode(weight float64, customID string) string {
 	health := &healthGate{healthy: true}
 	ctrl, err := rendezgo.NewController(cfg, client, &playConsumerFactory{}, rendezgo.NopLogger(), rendezgo.NopMetrics(), rendezgo.WithWeightProvider(e.weights), rendezgo.WithHealthChecker(health))
 	if err != nil {
-		e.emit(EventError, fmt.Sprintf("add node %s: %v", id, err), nil)
-		return ""
+		return "", e.recordError(fmt.Sprintf("add node %s: %v", id, err), map[string]interface{}{"nodeID": id})
 	}
 	nodeID := cfg.ClusterID + ":" + cfg.NodeID
 	e.weights.Set(nodeID, weight)
-	nodeCtx, cancel := context.WithCancel(context.Background())
-	go ctrl.Start(nodeCtx)
-	n := &simNode{id: nodeID, weight: weight, cancel: cancel, ctrl: ctrl, client: client, hook: hook, health: health, healthy: true}
+	nodeCtx, cancel := context.WithCancel(e.ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ctrl.Start(nodeCtx)
+	}()
+	n := &simNode{id: nodeID, weight: weight, cancel: cancel, done: done, ctrl: ctrl, client: client, hook: hook, health: health, healthy: true}
 	e.nodes[nodeID] = n
-	e.emit(EventInfo, fmt.Sprintf("added node %s (weight %.2f)", nodeID, weight), map[string]interface{}{"node": nodeID, "weight": weight})
-	return nodeID
+	e.recordEvent(EventNodeAdd, fmt.Sprintf("added node %s weight=%.2f", nodeID, weight), map[string]interface{}{"nodeID": nodeID, "weight": weight})
+	return nodeID, nil
 }
 
-func (e *Engine) removeNode(id string, graceful bool) {
+func (e *Engine) removeNode(id string, graceful bool, eventType EventType) error {
 	e.mu.Lock()
 	node, ok := e.nodes[id]
 	if ok {
@@ -379,107 +637,25 @@ func (e *Engine) removeNode(id string, graceful bool) {
 	}
 	e.mu.Unlock()
 	if !ok {
-		e.emit(EventError, fmt.Sprintf("node %s not found", id), nil)
-		return
+		return e.recordError(fmt.Sprintf("node %s not found", id), map[string]interface{}{"nodeID": id})
 	}
 	node.ctrl.SetReleaseOnShutdown(graceful)
 	node.cancel()
+	if node.done != nil {
+		select {
+		case <-node.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 	_ = node.client.Close()
-	e.emit(EventInfo, fmt.Sprintf("removed node %s", id), map[string]interface{}{"node": id, "graceful": graceful})
-}
-
-func (e *Engine) restartNode(id string) {
-	e.mu.Lock()
-	node, ok := e.nodes[id]
-	weight := 1.0
-	if ok {
-		weight = node.weight
-	}
-	e.mu.Unlock()
-	if !ok {
-		e.emit(EventError, fmt.Sprintf("node %s not found", id), nil)
-		return
-	}
-	e.removeNode(id, true)
-	base := id
-	if strings.Contains(id, ":") {
-		parts := strings.Split(id, ":")
-		base = parts[len(parts)-1]
-	}
-	newID := e.addNode(weight, base)
-	e.emit(EventInfo, fmt.Sprintf("restarted %s -> %s", id, newID), map[string]interface{}{"from": id, "to": newID})
-}
-
-func (e *Engine) adjustWeight(id string, weight float64) {
-	e.mu.Lock()
-	node, ok := e.nodes[id]
-	if ok {
-		node.weight = weight
-	}
-	e.mu.Unlock()
-	if !ok {
-		e.emit(EventError, fmt.Sprintf("node %s not found", id), nil)
-		return
-	}
-	e.weights.Set(id, weight)
-	e.emit(EventInfo, fmt.Sprintf("weight %s=%.2f", id, weight), map[string]interface{}{"node": id, "weight": weight})
-}
-
-func (e *Engine) setRedisFault(id string, fail bool) {
-	e.mu.Lock()
-	node, ok := e.nodes[id]
-	e.mu.Unlock()
-	if !ok {
-		e.emit(EventError, fmt.Sprintf("node %s not found", id), nil)
-		return
-	}
-	node.hook.fail.Store(fail)
-	e.emit(EventInfo, fmt.Sprintf("fail %s=%v", id, fail), map[string]interface{}{"node": id, "fail": fail})
-}
-
-func (e *Engine) setHealth(id string, healthy bool) {
-	e.mu.Lock()
-	node, ok := e.nodes[id]
-	e.mu.Unlock()
-	if !ok {
-		e.emit(EventError, fmt.Sprintf("node %s not found", id), nil)
-		return
-	}
-	node.health.Set(healthy)
-	node.healthy = healthy
-	e.emit(EventInfo, fmt.Sprintf("health %s=%v", id, healthy), map[string]interface{}{"node": id, "healthy": healthy})
-}
-
-func (e *Engine) setShedding(on bool) {
-	e.mu.Lock()
-	e.template.SheddingEnabled = on
-	e.mu.Unlock()
-	e.restartAll()
-	e.emit(EventInfo, fmt.Sprintf("shedding %v", on), map[string]interface{}{"enabled": on})
-}
-
-func (e *Engine) setRelease(n int) {
-	e.mu.Lock()
-	e.template.SheddingRelease = n
-	e.mu.Unlock()
-	e.restartAll()
-	e.emit(EventInfo, fmt.Sprintf("shedding release=%d", n), map[string]interface{}{"release": n})
-}
-
-func (e *Engine) setFocus(focus string) {
-	if focus == "none" {
-		focus = ""
-	}
-	e.mu.Lock()
-	e.focus = focus
-	e.mu.Unlock()
-	e.emit(EventInfo, fmt.Sprintf("focus set to %s", focus), map[string]interface{}{"focus": focus})
+	e.recordEvent(eventType, fmt.Sprintf("removed node %s graceful=%v", id, graceful), map[string]interface{}{"nodeID": id, "graceful": graceful})
+	return nil
 }
 
 func (e *Engine) restartAll() {
 	ids := e.nodeIDs()
 	for _, id := range ids {
-		e.restartNode(id)
+		_ = e.RestartNode(id)
 	}
 }
 
@@ -494,68 +670,89 @@ func (e *Engine) nodeIDs() []string {
 	return ids
 }
 
-func (e *Engine) Snapshot() Snapshot {
+func (e *Engine) buildSnapshot(now time.Time) Snapshot {
 	e.mu.Lock()
 	workloads := append([]rendezgo.WorkloadConfig{}, e.template.StaticWorkloads...)
 	focus := e.focus
-	caps := CapsSummary{
-		MaxPerNode:      e.template.MaxConsumersPerNode,
-		MaxPerWorkload:  e.template.MaxConsumersPerWorkloadPerNode,
-		MinPerNode:      e.template.MinConsumersPerNode,
-		SheddingEnabled: e.template.SheddingEnabled,
-		SheddingRelease: e.template.SheddingRelease,
-	}
-	mode := e.mode
+	clusterID := e.template.ClusterID
+	topK := e.opts.TopK
+	cfg := e.template
+	mode := e.opts.Mode
 	redisAddr := e.redisAddr
-	topK := e.topK
 	e.mu.Unlock()
 
 	owners, leaseTTLs, cooldownTTLs := e.redisState(workloads)
 	desired := rendezgo.DesiredOwners(workloads, e.liveWeights(""))
 	e.updateChurn(owners)
+	e.mu.Lock()
+	churnCount := len(e.churn)
+	e.mu.Unlock()
 
 	nodes := e.buildNodeSnapshots(workloads, desired, owners)
-	units := e.buildUnitSnapshots(workloads, owners, desired, leaseTTLs, cooldownTTLs, topK, focus)
+	units, totals := e.buildUnitSnapshots(workloads, owners, desired, leaseTTLs, cooldownTTLs, topK)
 
 	convergence := 0.0
-	if len(units) > 0 {
-		aligned := 0
-		for _, u := range units {
-			if u.Aligned {
-				aligned++
-			}
-		}
-		convergence = (float64(aligned) / float64(len(units))) * 100
+	totalUnits := totals.desiredUnits
+	if totalUnits > 0 {
+		convergence = (float64(totalUnits-totals.misalignedUnits) / float64(totalUnits)) * 100
 	}
 
-	wlSummaries := make([]WorkloadSummary, 0, len(workloads))
+	wlSummaries := make([]SnapshotWorkload, 0, len(workloads))
 	for _, wl := range workloads {
-		wlSummaries = append(wlSummaries, WorkloadSummary{Name: wl.Name, Units: wl.Units})
+		wlSummaries = append(wlSummaries, SnapshotWorkload{Name: wl.Name, Units: wl.Units})
 	}
+	sort.Slice(wlSummaries, func(i, j int) bool { return wlSummaries[i].Name < wlSummaries[j].Name })
 
 	return Snapshot{
-		Now:            time.Now(),
-		RedisAddr:      redisAddr,
-		Mode:           string(mode),
-		ChurnPerMinute: len(e.churn),
-		Convergence:    convergence,
-		Focus:          focus,
-		TopK:           topK,
-		Caps:           caps,
-		Workloads:      wlSummaries,
-		Nodes:          nodes,
-		Units:          units,
+		NowUnixMs:     now.UnixMilli(),
+		Mode:          mode,
+		RedisAddr:     redisAddr,
+		ClusterID:     clusterID,
+		FocusWorkload: focus,
+		TopK:          topK,
+		Config: SnapshotConfig{
+			LeaseTTLms:                     cfg.LeaseTTL.Milliseconds(),
+			LeaseRenewIntervalms:           cfg.LeaseRenewInterval.Milliseconds(),
+			HeartbeatTTLms:                 cfg.HeartbeatTTL.Milliseconds(),
+			HeartbeatIntervalms:            cfg.HeartbeatInterval.Milliseconds(),
+			ReconcileIntervalms:            cfg.ReconcileInterval.Milliseconds(),
+			ReconcileJitter:                cfg.ReconcileJitter,
+			MinConsumerRuntimems:           cfg.MinConsumerRuntime.Milliseconds(),
+			SlotMoveCooldownms:             cfg.SlotMoveCooldown.Milliseconds(),
+			RedisBackoffms:                 cfg.RedisBackoff.Milliseconds(),
+			AcquireLimit:                   cfg.AcquireLimit,
+			MaxConsumersPerNode:            cfg.MaxConsumersPerNode,
+			MaxConsumersPerWorkloadPerNode: cfg.MaxConsumersPerWorkloadPerNode,
+			MinConsumersPerNode:            cfg.MinConsumersPerNode,
+			SheddingEnabled:                cfg.SheddingEnabled,
+			SheddingRelease:                cfg.SheddingRelease,
+		},
+		Metrics: SnapshotMetrics{
+			ChurnPerMinute:       churnCount,
+			ConvergencePct:       convergence,
+			OwnedUnitsTotal:      totals.ownedUnits,
+			DesiredUnitsTotal:    totals.desiredUnits,
+			MisalignedUnitsTotal: totals.misalignedUnits,
+		},
+		Workloads: wlSummaries,
+		Nodes:     nodes,
+		Units:     units,
 	}
 }
 
-func (e *Engine) EventsSince(seq uint64) ([]Event, uint64) {
-	return e.events.Since(seq)
+type unitTotals struct {
+	ownedUnits      int
+	desiredUnits    int
+	misalignedUnits int
 }
 
 func (e *Engine) redisState(workloads []rendezgo.WorkloadConfig) (map[string]string, map[string]time.Duration, map[string]time.Duration) {
 	owners := map[string]string{}
 	leaseTTLs := map[string]time.Duration{}
 	cooldownTTLs := map[string]time.Duration{}
+	if e.admin == nil {
+		return owners, leaseTTLs, cooldownTTLs
+	}
 	ctx := context.Background()
 	pipe := e.admin.Pipeline()
 	leaseCmds := map[string]*redis.StringCmd{}
@@ -564,10 +761,11 @@ func (e *Engine) redisState(workloads []rendezgo.WorkloadConfig) (map[string]str
 	for _, wl := range workloads {
 		for unit := 0; unit < wl.Units; unit++ {
 			slot := rendezgo.Slot{Workload: wl.Name, Unit: unit}
-			key := e.leaseKey(slot)
-			leaseCmds[key] = pipe.Get(ctx, key)
-			ttlCmds[key] = pipe.PTTL(ctx, key)
-			coolCmds[key] = pipe.PTTL(ctx, e.cooldownKey(slot))
+			leaseKey := e.leaseKey(slot)
+			cooldownKey := e.cooldownKey(slot)
+			leaseCmds[leaseKey] = pipe.Get(ctx, leaseKey)
+			ttlCmds[leaseKey] = pipe.PTTL(ctx, leaseKey)
+			coolCmds[cooldownKey] = pipe.PTTL(ctx, cooldownKey)
 		}
 	}
 	if len(leaseCmds) > 0 {
@@ -591,7 +789,30 @@ func (e *Engine) redisState(workloads []rendezgo.WorkloadConfig) (map[string]str
 	return owners, leaseTTLs, cooldownTTLs
 }
 
-func (e *Engine) buildNodeSnapshots(workloads []rendezgo.WorkloadConfig, desired map[string]string, owners map[string]string) []NodeSnapshot {
+func (e *Engine) driveSimulatedTime(ctx context.Context, server *miniredis.Miniredis, stop <-chan struct{}) {
+	now := time.Now()
+	server.SetTime(now)
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	last := now
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-t.C:
+			cur := time.Now()
+			delta := cur.Sub(last)
+			last = cur
+			if delta > 0 {
+				server.FastForward(delta)
+			}
+		}
+	}
+}
+
+func (e *Engine) buildNodeSnapshots(workloads []rendezgo.WorkloadConfig, desired map[string]string, owners map[string]string) []SnapshotNode {
 	e.mu.Lock()
 	nodes := make(map[string]*simNode, len(e.nodes))
 	for id, n := range e.nodes {
@@ -599,10 +820,20 @@ func (e *Engine) buildNodeSnapshots(workloads []rendezgo.WorkloadConfig, desired
 	}
 	e.mu.Unlock()
 	weightSnap := e.weights.Snapshot()
-	nodeSnaps := map[string]*NodeSnapshot{}
+	nodeSnaps := map[string]*SnapshotNode{}
 	for id := range nodes {
-		nodeSnaps[id] = &NodeSnapshot{ID: id, Weight: weightSnap[id], Workload: map[string]WorkloadCount{}}
+		nodeSnaps[id] = &SnapshotNode{
+			ID:            id,
+			ShortID:       shortID(id),
+			Weight:        weightSnap[id],
+			State:         e.nodeState(nodes[id]),
+			Healthy:       nodes[id].healthy,
+			RedisFault:    nodes[id].redisFail,
+			BackoffActive: nodes[id].ctrl != nil && nodes[id].ctrl.BackoffActive(),
+			Workloads:     []SnapshotNodeWorkload{},
+		}
 	}
+
 	for key, owner := range owners {
 		if owner == "" {
 			continue
@@ -613,14 +844,19 @@ func (e *Engine) buildNodeSnapshots(workloads []rendezgo.WorkloadConfig, desired
 		}
 		ns, ok := nodeSnaps[owner]
 		if !ok {
-			ns = &NodeSnapshot{ID: owner, Weight: weightSnap[owner], Workload: map[string]WorkloadCount{}}
+			ns = &SnapshotNode{ID: owner, ShortID: shortID(owner), Weight: weightSnap[owner], State: e.nodeState(nil), Workloads: []SnapshotNodeWorkload{}}
 			nodeSnaps[owner] = ns
 		}
-		ns.Owned++
-		wc := ns.Workload[slot.Workload]
-		wc.Owned++
-		ns.Workload[slot.Workload] = wc
+		ns.OwnedUnits++
+		ns.Workloads = ensureWL(ns.Workloads, slot.Workload)
+		for i := range ns.Workloads {
+			if ns.Workloads[i].Name == slot.Workload {
+				ns.Workloads[i].OwnedUnits++
+				break
+			}
+		}
 	}
+
 	for key, want := range desired {
 		slot, err := e.slotFromLeaseKey(key)
 		if err != nil || want == "" {
@@ -628,61 +864,95 @@ func (e *Engine) buildNodeSnapshots(workloads []rendezgo.WorkloadConfig, desired
 		}
 		ns, ok := nodeSnaps[want]
 		if !ok {
-			ns = &NodeSnapshot{ID: want, Weight: weightSnap[want], Workload: map[string]WorkloadCount{}}
+			ns = &SnapshotNode{ID: want, ShortID: shortID(want), Weight: weightSnap[want], State: e.nodeState(nil), Workloads: []SnapshotNodeWorkload{}}
 			nodeSnaps[want] = ns
 		}
-		ns.Desired++
-		wc := ns.Workload[slot.Workload]
-		wc.Desired++
-		ns.Workload[slot.Workload] = wc
+		ns.DesiredUnits++
+		ns.Workloads = ensureWL(ns.Workloads, slot.Workload)
+		for i := range ns.Workloads {
+			if ns.Workloads[i].Name == slot.Workload {
+				ns.Workloads[i].DesiredUnits++
+				break
+			}
+		}
 	}
-	out := make([]NodeSnapshot, 0, len(nodeSnaps))
+
+	out := make([]SnapshotNode, 0, len(nodeSnaps))
 	for _, ns := range nodeSnaps {
-		if ns.Desired > ns.Owned {
-			ns.Missing = ns.Desired - ns.Owned
+		if ns.DesiredUnits > ns.OwnedUnits {
+			ns.MissingDesiredUnits = ns.DesiredUnits - ns.OwnedUnits
 		}
-		if ns.Owned > ns.Desired {
-			ns.Extra = ns.Owned - ns.Desired
+		if ns.OwnedUnits > ns.DesiredUnits {
+			ns.ExtraOwnedUnits = ns.OwnedUnits - ns.DesiredUnits
 		}
-		ns.State = e.nodeState(nodes[ns.ID])
+		sort.Slice(ns.Workloads, func(i, j int) bool { return ns.Workloads[i].Name < ns.Workloads[j].Name })
 		out = append(out, *ns)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-func (e *Engine) buildUnitSnapshots(workloads []rendezgo.WorkloadConfig, owners, desired map[string]string, leaseTTLs, cooldownTTLs map[string]time.Duration, topK int, focus string) []UnitSnapshot {
-	weights := e.liveWeights("")
-	units := make([]UnitSnapshot, 0)
-	for _, wl := range workloads {
-		if focus != "" && focus != wl.Name {
-			continue
+func ensureWL(list []SnapshotNodeWorkload, name string) []SnapshotNodeWorkload {
+	for _, wl := range list {
+		if wl.Name == name {
+			return list
 		}
+	}
+	return append(list, SnapshotNodeWorkload{Name: name})
+}
+
+func (e *Engine) buildUnitSnapshots(workloads []rendezgo.WorkloadConfig, owners, desired map[string]string, leaseTTLs, cooldownTTLs map[string]time.Duration, topK int) ([]SnapshotUnit, unitTotals) {
+	weights := e.liveWeights("")
+	units := make([]SnapshotUnit, 0)
+	totals := unitTotals{}
+	for _, wl := range workloads {
 		for unit := 0; unit < wl.Units; unit++ {
 			slot := rendezgo.Slot{Workload: wl.Name, Unit: unit}
 			key := e.leaseKey(slot)
 			owner := owners[key]
 			want := desired[key]
-			ranking := rendezgo.RendezvousRanking(slot, weights)
-			top := ranking
-			if topK > 0 && len(ranking) > topK {
-				top = ranking[:topK]
+			var ranking []rendezgo.NodeScore
+			if topK > 0 {
+				ranking = rendezgo.RendezvousTopK(slot, weights, topK)
+			} else {
+				ranking = rendezgo.RendezvousRanking(slot, weights)
 			}
-			cs := make([]CandidateScore, 0, len(top))
-			for _, r := range top {
-				cs = append(cs, CandidateScore{ID: r.ID, Score: r.Score, Weight: r.Weight})
+			candidates := make([]HRWCandidate, 0, len(ranking))
+			for _, r := range ranking {
+				candidates = append(candidates, HRWCandidate{
+					NodeID:  r.ID,
+					ShortID: shortID(r.ID),
+					Weight:  r.Weight,
+					Score:   r.Score,
+				})
 			}
-			units = append(units, UnitSnapshot{
-				Workload:     wl.Name,
-				Unit:         unit,
-				CurrentOwner: owner,
+			leaseTTL := leaseTTLs[key]
+			coolKey := e.cooldownKey(slot)
+			coolTTL := cooldownTTLs[coolKey]
+			aligned := want != "" && owner == want
+			if owner != "" {
+				totals.ownedUnits++
+			}
+			totals.desiredUnits++
+			if !aligned {
+				totals.misalignedUnits++
+			}
+			units = append(units, SnapshotUnit{
+				Workload: wl.Name,
+				Unit:     unit,
+				Lease: LeaseInfo{
+					Key:   key,
+					Owner: owner,
+					TTLMs: leaseTTL.Milliseconds(),
+				},
+				Cooldown: CooldownInfo{
+					Key:    coolKey,
+					Active: coolTTL > 0,
+					TTLMs:  coolTTL.Milliseconds(),
+				},
 				DesiredOwner: want,
-				LeaseTTL:     leaseTTLs[key],
-				CooldownTTL:  cooldownTTLs[e.cooldownKey(slot)],
-				Ranking:      cs,
-				Aligned:      owner != "" && owner == want,
-				Cooldown:     cooldownTTLs[e.cooldownKey(slot)] > 0,
-				Unowned:      owner == "",
+				Aligned:      aligned,
+				HRWTopK:      candidates,
 			})
 		}
 	}
@@ -692,7 +962,7 @@ func (e *Engine) buildUnitSnapshots(workloads []rendezgo.WorkloadConfig, owners,
 		}
 		return units[i].Workload < units[j].Workload
 	})
-	return units
+	return units, totals
 }
 
 func (e *Engine) updateChurn(current map[string]string) {
@@ -713,39 +983,6 @@ func (e *Engine) updateChurn(current map[string]string) {
 		e.churn = e.churn[idx:]
 	}
 	e.owners = current
-}
-
-func (e *Engine) predictDown(target string) {
-	full := e.liveWeights("")
-	remaining := e.liveWeights(target)
-	currentDesired := rendezgo.DesiredOwners(e.template.StaticWorkloads, full)
-	predicted := rendezgo.DesiredOwners(e.template.StaticWorkloads, remaining)
-	moved := []string{}
-	for key, newOwner := range predicted {
-		if currentDesired[key] != newOwner {
-			moved = append(moved, key)
-		}
-	}
-	sort.Strings(moved)
-	for _, key := range moved {
-		slot, err := e.slotFromLeaseKey(key)
-		if err != nil {
-			continue
-		}
-		ranking := rendezgo.RendezvousRanking(slot, remaining)
-		top := ranking
-		if e.topK > 0 && len(ranking) > e.topK {
-			top = ranking[:e.topK]
-		}
-		e.emit(EventPrediction, fmt.Sprintf("predict %s[%d]: %s -> %s", slot.Workload, slot.Unit, shortOwner(currentDesired[key]), shortOwner(predicted[key])), map[string]interface{}{"slot": slot.Key(), "candidates": top})
-	}
-}
-
-func (e *Engine) explain(workload string, unit int) {
-	weights := e.liveWeights("")
-	slot := rendezgo.Slot{Workload: workload, Unit: unit}
-	ranking := rendezgo.RendezvousRanking(slot, weights)
-	e.emit(EventInfo, fmt.Sprintf("explain %s[%d]", workload, unit), map[string]interface{}{"slot": slot.Key(), "ranking": ranking})
 }
 
 func (e *Engine) liveWeights(skip string) []rendezgo.NodeWeight {
@@ -772,103 +1009,188 @@ func (e *Engine) liveWeights(skip string) []rendezgo.NodeWeight {
 }
 
 func (e *Engine) runScenario(ctx context.Context, name string) {
-	e.emit(EventScenario, fmt.Sprintf("scenario %s start", name), map[string]interface{}{"scenario": name})
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+	e.recordEvent(EventScenarioStart, fmt.Sprintf("scenario %s start", name), map[string]interface{}{"scenario": name})
 	switch name {
 	case "scale-out":
-		e.addNode(1, "")
+		e.runScenarioStep("add node burst", func() { _ = e.AddNodes(1, 1) })
 		time.Sleep(time.Second)
-		for i := 0; i < 5; i++ {
-			e.addNode(1, "")
-		}
+		e.runScenarioStep("add +5", func() { _ = e.AddNodes(5, 1) })
 		time.Sleep(2 * time.Second)
-		for i := 0; i < 10; i++ {
-			e.addNode(1, "")
-		}
+		e.runScenarioStep("add +10", func() { _ = e.AddNodes(10, 1) })
 	case "pod-death":
 		nodes := e.nodeIDs()
 		target := len(nodes) / 2
 		rand.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
 		for i := 0; i < target; i++ {
-			e.removeNode(nodes[i], false)
+			id := nodes[i]
+			e.runScenarioStep("kill "+id, func() { _ = e.KillNode(id) })
 		}
 	case "redis-instability":
 		nodes := e.nodeIDs()
 		for i, id := range nodes {
 			if i%2 == 0 {
-				e.setRedisFault(id, true)
+				id := id
+				e.runScenarioStep("fault "+id, func() { _ = e.SetRedisFault(id, true) })
 			}
 		}
 		time.Sleep(3 * time.Second)
 		for _, id := range nodes {
-			e.setRedisFault(id, false)
+			id := id
+			e.runScenarioStep("heal "+id, func() { _ = e.SetRedisFault(id, false) })
 		}
 	case "weight-skew":
 		nodes := e.nodeIDs()
 		for i, id := range nodes {
-			e.adjustWeight(id, float64(i+1))
+			id := id
+			weight := float64(i + 1)
+			e.runScenarioStep(fmt.Sprintf("weight %s %.2f", id, weight), func() { _ = e.SetWeight(id, weight) })
 		}
 	case "cross-cluster":
-		e.spawnOtherCluster()
+		e.runScenarioStep("spawn other cluster", e.spawnOtherCluster)
 	case "lease-flapping":
 		nodes := e.nodeIDs()
-		if len(nodes) == 0 {
-			break
-		}
-		id := nodes[0]
-		for i := 0; i < 3; i++ {
-			e.setRedisFault(id, true)
-			time.Sleep(500 * time.Millisecond)
-			e.setRedisFault(id, false)
-			time.Sleep(700 * time.Millisecond)
+		if len(nodes) > 0 {
+			id := nodes[0]
+			for i := 0; i < 3; i++ {
+				e.runScenarioStep("fault "+id, func() { _ = e.SetRedisFault(id, true) })
+				time.Sleep(500 * time.Millisecond)
+				e.runScenarioStep("heal "+id, func() { _ = e.SetRedisFault(id, false) })
+				time.Sleep(700 * time.Millisecond)
+			}
 		}
 	default:
-		e.emit(EventError, "unknown scenario", map[string]interface{}{"scenario": name})
-	}
-	e.emit(EventScenario, fmt.Sprintf("scenario %s done", name), map[string]interface{}{"scenario": name})
-}
-
-func (e *Engine) runScenarioFile(ctx context.Context, path string) {
-	data, err := os.ReadFile(filepath.Clean(path))
-	if err != nil {
-		e.emit(EventError, fmt.Sprintf("read scenario: %v", err), map[string]interface{}{"file": path})
+		e.recordEvent(EventScenarioError, "unknown scenario", map[string]interface{}{"scenario": name})
 		return
 	}
-	var file scenarioFile
-	if strings.HasSuffix(path, ".json") {
-		if err := json.Unmarshal(data, &file.Events); err != nil {
-			e.emit(EventError, fmt.Sprintf("parse scenario: %v", err), map[string]interface{}{"file": path})
-			return
-		}
-	} else {
-		if err := yaml.Unmarshal(data, &file.Events); err != nil {
-			e.emit(EventError, fmt.Sprintf("parse scenario: %v", err), map[string]interface{}{"file": path})
-			return
-		}
+	e.recordEvent(EventScenarioDone, fmt.Sprintf("scenario %s done", name), map[string]interface{}{"scenario": name})
+	_ = ctx
+}
+
+func (e *Engine) runScenarioStep(label string, fn func()) {
+	e.recordEvent(EventScenarioStep, label, nil)
+	fn()
+}
+
+func (e *Engine) execScenarioCommand(ctx context.Context, line string) error {
+	_ = ctx
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
 	}
-	start := time.Now()
-	for _, evt := range file.Events {
-		delay, err := time.ParseDuration(evt.At)
-		if err != nil {
-			continue
-		}
-		wait := delay - time.Since(start)
-		if wait < 0 {
-			wait = 0
-		}
-		go func(ev scenarioEvent) {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(wait):
-				e.ExecCommand(context.Background(), ev.Command)
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return nil
+	}
+	cmd := strings.ToLower(fields[0])
+	args := fields[1:]
+	switch cmd {
+	case "add":
+		count := 1
+		weight := 1.0
+		if len(args) > 0 {
+			if v, err := strconv.Atoi(args[0]); err == nil {
+				count = v
 			}
-		}(evt)
+		}
+		if len(args) > 1 {
+			if v, err := strconv.ParseFloat(args[1], 64); err == nil {
+				weight = v
+			}
+		}
+		return e.AddNodes(count, weight)
+	case "remove":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: remove <id>")
+		}
+		return e.RemoveNode(args[0], true)
+	case "restart":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: restart <id>")
+		}
+		return e.RestartNode(args[0])
+	case "kill":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: kill <id>")
+		}
+		return e.KillNode(args[0])
+	case "weight":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: weight <id> <weight>")
+		}
+		w, err := strconv.ParseFloat(args[1], 64)
+		if err != nil {
+			return err
+		}
+		return e.SetWeight(args[0], w)
+	case "fail":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: fail <id> on|off")
+		}
+		return e.SetRedisFault(args[0], args[1] == "on")
+	case "health":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: health <id> on|off")
+		}
+		return e.SetHealth(args[0], args[1] == "on")
+	case "shedding":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: shedding on|off")
+		}
+		return e.SetShedding(args[0] == "on")
+	case "release":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: release <per-interval>")
+		}
+		if v, err := strconv.Atoi(args[0]); err == nil {
+			return e.SetSheddingRelease(v)
+		}
+		return fmt.Errorf("invalid release value")
+	case "scenario":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: scenario <name>")
+		}
+		return e.RunScenario(args[0])
+	case "focus":
+		if len(args) < 1 {
+			return fmt.Errorf("usage: focus <workload|none>")
+		}
+		if args[0] == "none" {
+			return e.SetFocus("")
+		}
+		return e.SetFocus(args[0])
+	case "predict":
+		if len(args) == 2 && args[0] == "down" {
+			_, err := e.PredictDown(args[1])
+			return err
+		}
+		return fmt.Errorf("usage: predict down <nodeID>")
+	case "explain":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: explain <workload> <unit>")
+		}
+		unit, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("unit must be integer")
+		}
+		_, err = e.ExplainUnit(args[0], unit)
+		return err
+	default:
+		return fmt.Errorf("unknown command")
 	}
-	e.emit(EventScenario, fmt.Sprintf("scenario file %s scheduled", path), map[string]interface{}{"file": path})
 }
 
 func (e *Engine) spawnOtherCluster() {
+	e.mu.Lock()
 	cfg := e.template
+	parentCtx := e.ctx
+	e.mu.Unlock()
 	cfg.ClusterID = "other"
 	cfg.NodeID = uuid.NewString()
 	client := redis.NewClient(&redis.Options{Addr: e.redisAddr})
@@ -877,17 +1199,24 @@ func (e *Engine) spawnOtherCluster() {
 	health := &healthGate{healthy: true}
 	ctrl, err := rendezgo.NewController(cfg, client, &playConsumerFactory{}, rendezgo.NopLogger(), rendezgo.NopMetrics(), rendezgo.WithWeightProvider(e.weights), rendezgo.WithHealthChecker(health))
 	if err != nil {
-		e.emit(EventError, fmt.Sprintf("spawn other cluster: %v", err), nil)
+		e.recordError(fmt.Sprintf("spawn other cluster: %v", err), nil)
 		return
 	}
 	nodeID := cfg.ClusterID + ":" + cfg.NodeID
 	e.weights.Set(nodeID, 1)
-	nodeCtx, cancel := context.WithCancel(context.Background())
-	go ctrl.Start(nodeCtx)
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	nodeCtx, cancel := context.WithCancel(parentCtx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ctrl.Start(nodeCtx)
+	}()
 	e.mu.Lock()
-	e.nodes[nodeID] = &simNode{id: nodeID, weight: 1, cancel: cancel, ctrl: ctrl, client: client, hook: hook, health: health, healthy: true}
+	e.nodes[nodeID] = &simNode{id: nodeID, weight: 1, cancel: cancel, done: done, ctrl: ctrl, client: client, hook: hook, health: health, healthy: true}
 	e.mu.Unlock()
-	e.emit(EventInfo, fmt.Sprintf("added other cluster node %s", nodeID), map[string]interface{}{"node": nodeID})
+	e.recordEvent(EventNodeAdd, fmt.Sprintf("added other cluster node %s", nodeID), map[string]interface{}{"nodeID": nodeID})
 }
 
 // helpers
@@ -923,7 +1252,7 @@ func (e *Engine) nodeState(n *simNode) string {
 	return "ok"
 }
 
-func shortOwner(owner string) string {
+func shortID(owner string) string {
 	if owner == "" {
 		return "-"
 	}
@@ -1050,4 +1379,66 @@ type scenarioFile struct {
 type scenarioEvent struct {
 	At      string `json:"at" yaml:"at"`
 	Command string `json:"command" yaml:"command"`
+}
+
+func (e *Engine) recordEvent(t EventType, msg string, fields map[string]interface{}) {
+	e.events.Append(Event{AtUnixMs: time.Now().UnixMilli(), Type: t, Message: msg, Fields: fields})
+}
+
+func (e *Engine) recordError(msg string, fields map[string]interface{}) error {
+	e.recordEvent(EventError, msg, fields)
+	return errors.New(msg)
+}
+
+// EmitEvent allows external callers (HTTP layer) to push events.
+func (e *Engine) EmitEvent(t EventType, msg string, fields map[string]interface{}) {
+	e.recordEvent(t, msg, fields)
+}
+
+// EmitErrorEvent records an error event and returns it as an error for convenience.
+func (e *Engine) EmitErrorEvent(msg string, fields map[string]interface{}) error {
+	return e.recordError(msg, fields)
+}
+
+func interpolateSnapshot(s Snapshot, drift time.Duration) Snapshot {
+	cp := deepCopySnapshot(s)
+	cp.NowUnixMs = cp.NowUnixMs + drift.Milliseconds()
+	for i := range cp.Units {
+		if cp.Units[i].Lease.TTLMs > 0 {
+			cp.Units[i].Lease.TTLMs = max64(cp.Units[i].Lease.TTLMs-drift.Milliseconds(), 0)
+		}
+		if cp.Units[i].Cooldown.TTLMs > 0 {
+			cp.Units[i].Cooldown.TTLMs = max64(cp.Units[i].Cooldown.TTLMs-drift.Milliseconds(), 0)
+			cp.Units[i].Cooldown.Active = cp.Units[i].Cooldown.TTLMs > 0
+		}
+	}
+	return cp
+}
+
+func deepCopySnapshot(s Snapshot) Snapshot {
+	cp := s
+	cp.Workloads = append([]SnapshotWorkload{}, s.Workloads...)
+	cp.Nodes = append([]SnapshotNode{}, s.Nodes...)
+	for i := range cp.Nodes {
+		cp.Nodes[i].Workloads = append([]SnapshotNodeWorkload{}, s.Nodes[i].Workloads...)
+	}
+	cp.Units = append([]SnapshotUnit{}, s.Units...)
+	for i := range cp.Units {
+		cp.Units[i].HRWTopK = append([]HRWCandidate{}, s.Units[i].HRWTopK...)
+	}
+	return cp
+}
+
+func maxTTL(ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	return ttl.Milliseconds()
+}
+
+func max64(v int64, floor int64) int64 {
+	if v < floor {
+		return floor
+	}
+	return v
 }

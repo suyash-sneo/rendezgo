@@ -106,20 +106,18 @@ All knobs are exposed on `Config`; validate with `Validate()` before wiring up a
 
 ## Chaos playground
 
-An interactive chaos lab that runs real controllers against an in-process Redis by default:
+Web HUD (no TUI) that runs controllers against in-process Redis by default:
 
 ```
 go run ./playground/cmd                 # simulated Redis
 go run ./playground/cmd -mode=real -redis=host:6379
-# or from within the playground dir:
-# cd playground && go run ./cmd
 ```
 
-TUI shows a persistent log pane (no flickering), header with caps + convergence, nodes table, unit ownership view, and HRW candidates. Keys: `:` to enter command input, `?` help, `q`/Ctrl+C quit, arrow/Page keys to scroll the log, and Up/Down to navigate command history while editing. Commands: `add [n] [weight]`, `remove <id>`, `restart <id>`, `kill <id>`, `weight <id> <w>`, `fail <id> on|off`, `health <id> on|off`, `shedding on|off`, `release <n>`, `focus <workload|none>`, `predict down <node>`, `explain <workload> <unit>`, `scenario <name>`, `load <file>`. Flags: `-workloads` (`name:units,...`), `-nodes` (initial nodes), `-topk`, `-mode`, `-redis`, `-scenario`, `-scenario-file`. Scenario files are simple YAML/JSON lists of timed commands.
+The UI is glassy/technical: churn + convergence HUD, nodes with health/backoff/redis-fault toggles and weight editor, per-workload unit grid with lease TTL bars and cooldown bars, misalignment markers, HRW top-K hover, node/unit selection, explain-unit + predict-down actions, and a persistent SSE event timeline with filters/export. Controls live behind Add Node / Scenario / Settings / Help buttons; snapshot polling is 1s and events are streamed so nothing vanishes on refresh. See `playground/README.md` for API endpoints and scenario upload examples.
 
 ## Architecture
 
-See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendezgo` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `playground/sim`, `playground/ui/tui`, `playground/cmd`).
+See `docs/architecture.md` for loop breakdowns, key formats, stabilizers, and package layout (`pkg/rendezgo` for the public API, `internal/redis_scripts`, `cmd/rendez-agent`, `playground/sim`, `playground/server`, `playground/web`, `playground/cmd`).
 
 ## Testing
 

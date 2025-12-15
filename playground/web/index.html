@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>rendezgo playground</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div id="toast"></div>
+  <div class="page">
+    <header class="hud glass">
+      <div class="hud-left">
+        <div class="brand">rendezgo playground</div>
+        <div class="hud-chip" id="hud-mode">mode: simulated</div>
+        <div class="hud-chip" id="hud-redis">redis: -</div>
+        <div class="hud-chip" id="hud-cluster">cluster: -</div>
+      </div>
+      <div class="hud-center">
+        <div class="metric">
+          <div class="metric-label">Churn/min</div>
+          <div class="metric-value" id="metric-churn">0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Convergence</div>
+          <div class="metric-value" id="metric-convergence">0%</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Owned / Desired</div>
+          <div class="metric-value" id="metric-owned">0 / 0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Misaligned</div>
+          <div class="metric-value" id="metric-misaligned">0</div>
+        </div>
+        <div class="metric focus-control">
+          <label for="focus-select">Focus</label>
+          <select id="focus-select"></select>
+        </div>
+      </div>
+      <div class="hud-actions">
+        <button class="btn ghost" data-drawer="add">Add Node</button>
+        <button class="btn ghost" data-drawer="scenario">Scenario</button>
+        <button class="btn ghost" data-drawer="settings">Settings</button>
+        <button class="btn ghost" data-drawer="help">Help</button>
+      </div>
+    </header>
+
+    <div id="drawer" class="drawer glass hidden">
+      <div class="drawer-header">
+        <div id="drawer-title"></div>
+        <button id="drawer-close" class="btn icon">x</button>
+      </div>
+      <div id="drawer-body"></div>
+    </div>
+
+    <main class="layout">
+      <section class="panel glass" id="nodes-panel">
+        <div class="panel-title">Nodes</div>
+        <div id="nodes-list" class="node-list"></div>
+      </section>
+      <section class="panel glass" id="assignments-panel">
+        <div class="panel-title">Assignments</div>
+        <div id="assignments"></div>
+      </section>
+      <section class="panel glass" id="details-panel">
+        <div class="panel-title">Details</div>
+        <div id="details-body" class="details-body"></div>
+      </section>
+    </main>
+
+    <section class="panel glass" id="events-panel">
+      <div class="panel-title">Event timeline</div>
+      <div class="event-controls">
+        <input id="event-search" type="text" placeholder="filter by text, nodeID, workload, unit">
+        <select id="event-type-filter">
+          <option value="all">all types</option>
+          <option value="engine">engine</option>
+          <option value="node">node</option>
+          <option value="scenario">scenario</option>
+          <option value="predict">predict</option>
+          <option value="explain">explain</option>
+          <option value="error">error</option>
+        </select>
+        <div class="spacer"></div>
+        <button id="export-events" class="btn ghost">Export JSON</button>
+      </div>
+      <div id="events-list" class="events-list"></div>
+    </section>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

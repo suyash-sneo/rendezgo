@@ -70,3 +70,29 @@ func TestMinimalChurnOnRemoval(t *testing.T) {
 		t.Fatalf("unexpected movement ratio %.2f", ratio)
 	}
 }
+
+func TestRendezvousTopKMatchesFullRanking(t *testing.T) {
+	nodes := []NodeWeight{
+		{ID: "a", Weight: 1},
+		{ID: "b", Weight: 1},
+		{ID: "c", Weight: 1},
+		{ID: "d", Weight: 1},
+		{ID: "zero", Weight: 0},
+	}
+	slot := Slot{Workload: "alpha", Unit: 3}
+
+	full := RendezvousRanking(slot, nodes)
+	top := RendezvousTopK(slot, nodes, 3)
+	if len(full) < 3 || len(top) != 3 {
+		t.Fatalf("unexpected lengths: full=%d top=%d", len(full), len(top))
+	}
+	for i := 0; i < 3; i++ {
+		if full[i].ID != top[i].ID || full[i].Score != top[i].Score {
+			t.Fatalf("mismatch at %d: full=%+v top=%+v", i, full[i], top[i])
+		}
+	}
+	owner, ok := RendezvousOwner(slot, nodes)
+	if !ok || owner != full[0].ID {
+		t.Fatalf("owner mismatch: ok=%v owner=%q full0=%q", ok, owner, full[0].ID)
+	}
+}

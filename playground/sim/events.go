@@ -2,27 +2,43 @@ package sim
 
 import (
 	"sync"
-	"time"
 )
 
+// EventType enumerates all event kinds emitted by the engine.
 type EventType string
 
 const (
-	EventCommand    EventType = "command"
-	EventInfo       EventType = "info"
-	EventError      EventType = "error"
-	EventScenario   EventType = "scenario"
-	EventPrediction EventType = "prediction"
+	EventEngineStart   EventType = "engine.start"
+	EventEngineStop    EventType = "engine.stop"
+	EventNodeAdd       EventType = "node.add"
+	EventNodeRemove    EventType = "node.remove"
+	EventNodeRestart   EventType = "node.restart"
+	EventNodeKill      EventType = "node.kill"
+	EventNodeWeight    EventType = "node.weight"
+	EventNodeHealth    EventType = "node.health"
+	EventNodeRedisFail EventType = "node.redisFault"
+	EventShedding      EventType = "shedding.toggle"
+	EventSheddingRate  EventType = "shedding.release"
+	EventFocus         EventType = "focus.set"
+	EventScenarioStart EventType = "scenario.start"
+	EventScenarioStep  EventType = "scenario.step"
+	EventScenarioDone  EventType = "scenario.done"
+	EventScenarioError EventType = "scenario.error"
+	EventPredictDown   EventType = "predict.down"
+	EventExplainUnit   EventType = "explain.unit"
+	EventError         EventType = "error"
 )
 
+// Event is stored in the ring buffer and streamed via SSE.
 type Event struct {
-	Seq     uint64                 `json:"seq"`
-	At      time.Time              `json:"at"`
-	Type    EventType              `json:"type"`
-	Message string                 `json:"message"`
-	Fields  map[string]interface{} `json:"fields,omitempty"`
+	Seq      uint64                 `json:"seq"`
+	AtUnixMs int64                  `json:"atUnixMs"`
+	Type     EventType              `json:"type"`
+	Message  string                 `json:"message"`
+	Fields   map[string]interface{} `json:"fields,omitempty"`
 }
 
+// RingBuffer is a fixed-size buffer used for event history.
 type RingBuffer struct {
 	mu       sync.Mutex
 	capacity int
@@ -30,6 +46,7 @@ type RingBuffer struct {
 	nextSeq  uint64
 }
 
+// NewRingBuffer constructs a ring buffer with the given capacity.
 func NewRingBuffer(capacity int) *RingBuffer {
 	if capacity <= 0 {
 		capacity = 2000
@@ -37,7 +54,7 @@ func NewRingBuffer(capacity int) *RingBuffer {
 	return &RingBuffer{capacity: capacity, nextSeq: 1}
 }
 
-// Append adds an event and returns the assigned sequence number.
+// Append adds an event and returns its assigned sequence.
 func (r *RingBuffer) Append(ev Event) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
